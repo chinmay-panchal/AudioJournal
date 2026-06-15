@@ -68,7 +68,11 @@ class RecorderService extends ChangeNotifier {
         notifyListeners();
         loadRecordings().then((_) {
           if (_currentRecordingPath != null) {
-            _triggerTranscription(_currentRecordingPath!);
+            TranscriptionService.loadSidecar(_currentRecordingPath!).then((sidecar) {
+              if (sidecar.status == TranscriptStatus.idle) {
+                _triggerTranscription(_currentRecordingPath!);
+              }
+            });
           }
         });
       } else if (status == 'error') {
@@ -105,9 +109,13 @@ class RecorderService extends ChangeNotifier {
       final status = await Permission.microphone.status;
       debugPrint('Mic permission current status: $status');
 
+      if (status.isPermanentlyDenied || status.isDenied) {
+        await openAppSettings();
+        return false;
+      }
+
       final result = await Permission.microphone.request();
       debugPrint('Mic permission after request: $result');
-
       return result.isGranted;
     }
     return false;
@@ -133,7 +141,7 @@ class RecorderService extends ChangeNotifier {
     final recordingsDir = await _recordingsDirectory;
     final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
     // final tempFilePath = '${recordingsDir.path}/REC_${timestamp}_TEMP.m4a';
-final tempFilePath = '${recordingsDir.path}/REC_${timestamp}_TEMP.wav';
+    final tempFilePath = '${recordingsDir.path}/REC_${timestamp}_TEMP.wav';
 
     if (Platform.isAndroid) {
       final prefs = await SharedPreferences.getInstance();
@@ -156,25 +164,24 @@ final tempFilePath = '${recordingsDir.path}/REC_${timestamp}_TEMP.wav';
       await _startSilentAudioIos();
 
       _iosRecorder = AudioRecorder();
-// const config = RecordConfig(
-//   encoder: AudioEncoder.aacLc,
-//   sampleRate: 16000,  // was 44100
-//   numChannels: 1,     // mono
-//   bitRate: 32000,     // 32kbps — enough for speech
-//   autoGain: true,
-//   echoCancel: true,
-//   noiseSuppress: true,
-// );
+      // const config = RecordConfig(
+      //   encoder: AudioEncoder.aacLc,
+      //   sampleRate: 16000,  // was 44100
+      //   numChannels: 1,     // mono
+      //   bitRate: 32000,     // 32kbps — enough for speech
+      //   autoGain: true,
+      //   echoCancel: true,
+      //   noiseSuppress: true,
+      // );
 
-const config = RecordConfig(
-  encoder: AudioEncoder.wav, // record as WAV directly
-  sampleRate: 16000,         // exactly what Whisper needs
-  numChannels: 1,            // mono
-  autoGain: true,
-  echoCancel: true,
-  noiseSuppress: true,
-);
-
+      const config = RecordConfig(
+        encoder: AudioEncoder.wav, // record as WAV directly
+        sampleRate: 16000, // exactly what Whisper needs
+        numChannels: 1, // mono
+        autoGain: true,
+        echoCancel: true,
+        noiseSuppress: true,
+      );
 
       await _iosRecorder!.start(config, path: tempFilePath);
       _iosStopwatch = Stopwatch()..start();
@@ -261,13 +268,22 @@ const config = RecordConfig(
       final sourcePath = picked.path;
       if (sourcePath == null) return false;
 
+      // Probe the actual duration using just_audio
+      int durationMs = 0;
+      try {
+        final probe = AudioPlayer();
+        final duration = await probe.setFilePath(sourcePath);
+        durationMs = duration?.inMilliseconds ?? 0;
+        await probe.dispose();
+      } catch (_) {
+        durationMs = 0;
+      }
+
       final recordingsDir = await _recordingsDirectory;
       final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
       final ext = sourcePath.split('.').last.toLowerCase();
 
-      // Use 0 as duration placeholder — we can't know the duration without
-      // probing, and the file will be renamed consistently with other recordings.
-      final destPath = '${recordingsDir.path}/REC_${timestamp}_0.$ext';
+      final destPath = '${recordingsDir.path}/REC_${timestamp}_${durationMs}.$ext';
 
       final sourceFile = File(sourcePath);
       await sourceFile.copy(destPath);
@@ -294,26 +310,78 @@ const config = RecordConfig(
 
     final languageCode = _selectedLanguage.apiCode;
 
-    TranscriptionService.transcribeFile(
-      audioPath,
-      languageCode: languageCode,
-    ).then((text) {
-      final sidecar = TranscriptionSidecar(
-        status: TranscriptStatus.done,
-        transcript: text,
-        language: languageCode,
-      );
-      TranscriptionService.saveSidecar(audioPath, sidecar);
-      _applyTranscriptSidecar(audioPath, sidecar);
-    }).catchError((Object err) {
-      debugPrint('[RecorderService] Transcription failed: $err');
-      final sidecar = TranscriptionSidecar(
-        status: TranscriptStatus.failed,
-        language: languageCode,
-      );
-      TranscriptionService.saveSidecar(audioPath, sidecar);
-      _applyTranscriptSidecar(audioPath, sidecar);
-    });
+    TranscriptionService.transcribeFile(audioPath, languageCode: languageCode)
+        .then((result) {
+          final rec = _findByPath(audioPath);
+          final sidecar = TranscriptionSidecar(
+            status: TranscriptStatus.done,
+            transcript: result.transcript,
+            summary: result.summary,
+            title: result.title.isNotEmpty ? result.title : null,
+            language: result.language.isNotEmpty
+                ? result.language
+                : languageCode,
+            durationMs: rec?.duration.inMilliseconds,
+          );
+          TranscriptionService.saveSidecar(audioPath, sidecar);
+          _applyTranscriptSidecar(audioPath, sidecar);
+
+          // ── Auto-rename using AI title (preferred) or first 6 words of summary ──
+          String? renameTarget;
+          if (result.title.isNotEmpty) {
+            // Use the AI title directly
+            renameTarget = result.title
+                .replaceAll(RegExp(r'[^\w\s]'), '')
+                .trim()
+                .replaceAll(RegExp(r'\s+'), '_');
+          } else if (result.summary.isNotEmpty) {
+            // Fallback: first 6 clean words
+            renameTarget = result.summary
+                .replaceAll(RegExp(r'[^\w\s]'), '')
+                .trim()
+                .split(RegExp(r'\s+'))
+                .where((w) => w.isNotEmpty)
+                .take(6)
+                .join('_');
+          }
+          if (renameTarget != null && renameTarget.isNotEmpty) {
+            final rec = _findByPath(audioPath);
+            if (rec != null) renameRecording(rec, renameTarget);
+          }
+        })
+        .catchError((Object err) {
+          debugPrint('[RecorderService] Transcription failed: $err');
+          final rec = _findByPath(audioPath);
+          final sidecar = TranscriptionSidecar(
+            status: TranscriptStatus.failed,
+            language: languageCode,
+            durationMs: rec?.duration.inMilliseconds,
+          );
+          TranscriptionService.saveSidecar(audioPath, sidecar);
+          _applyTranscriptSidecar(audioPath, sidecar);
+        });
+  }
+
+  Future<void> renameRecording(Recording recording, String newName) async {
+    try {
+      final file = File(recording.path);
+      final dir = file.parent.path;
+      final ext = recording.path.split('.').last;
+      final newPath = '$dir/$newName.$ext';
+
+      // Rename audio file
+      await file.rename(newPath);
+
+      // Move sidecar too
+      final oldSidecar = File(TranscriptionService.sidecarPath(recording.path));
+      if (await oldSidecar.exists()) {
+        await oldSidecar.rename(TranscriptionService.sidecarPath(newPath));
+      }
+
+      await loadRecordings();
+    } catch (e) {
+      debugPrint('[RecorderService] renameRecording error: $e');
+    }
   }
 
   /// Public method to retry a failed transcription.
@@ -336,7 +404,10 @@ const config = RecordConfig(
     if (status == TranscriptStatus.pending) {
       TranscriptionService.saveSidecar(
         audioPath,
-        TranscriptionSidecar(status: status),
+        TranscriptionSidecar(
+          status: status,
+          durationMs: rec?.duration.inMilliseconds,
+        ),
       );
     }
   }
@@ -376,8 +447,29 @@ const config = RecordConfig(
           final rec = Recording.fromFile(file);
           if (rec != null) {
             // Load transcript sidecar
-            final sidecar = await TranscriptionService.loadSidecar(file.path);
+            var sidecar = await TranscriptionService.loadSidecar(file.path);
             rec.applyTranscript(sidecar);
+
+            // If the sidecar has the duration stored, use it.
+            if (sidecar.durationMs != null) {
+              rec.duration = Duration(milliseconds: sidecar.durationMs!);
+            } else if (rec.duration == Duration.zero) {
+              // Otherwise, if the duration is zero (e.g. renamed file), probe it once.
+              try {
+                final probe = AudioPlayer();
+                final duration = await probe.setFilePath(file.path);
+                if (duration != null) {
+                  rec.duration = duration;
+                  // Save duration to sidecar so we don't have to probe it again next time
+                  sidecar = sidecar.copyWith(durationMs: duration.inMilliseconds);
+                  await TranscriptionService.saveSidecar(file.path, sidecar);
+                }
+                await probe.dispose();
+              } catch (e) {
+                debugPrint('[RecorderService] Probe duration error for ${file.path}: $e');
+              }
+            }
+
             fetched.add(rec);
           }
         }
@@ -417,15 +509,17 @@ const config = RecordConfig(
 
   Future<void> _configureAudioSessionForIos() async {
     final session = await AudioSession.instance;
-    await session.configure(const AudioSessionConfiguration(
-      avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
-      avAudioSessionCategoryOptions:
-          AVAudioSessionCategoryOptions.none, // defaultToSpeaker false
-      avAudioSessionMode: AVAudioSessionMode.defaultMode,
-      avAudioSessionRouteSharingPolicy:
-          AVAudioSessionRouteSharingPolicy.defaultPolicy,
-      avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
-    ));
+    await session.configure(
+      const AudioSessionConfiguration(
+        avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
+        avAudioSessionCategoryOptions:
+            AVAudioSessionCategoryOptions.none, // defaultToSpeaker false
+        avAudioSessionMode: AVAudioSessionMode.defaultMode,
+        avAudioSessionRouteSharingPolicy:
+            AVAudioSessionRouteSharingPolicy.defaultPolicy,
+        avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
+      ),
+    );
   }
 
   // iOS-specific silent audio keepalive

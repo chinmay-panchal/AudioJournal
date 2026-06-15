@@ -1,23 +1,26 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:whisper_flutter_new/whisper_flutter_new.dart';
+import 'package:google_generative_ai/google_generative_ai.dart';
 import '../constants.dart';
-import 'package:audio_decoder/audio_decoder.dart';
 
 enum TranscriptStatus { idle, pending, done, failed }
 
 class TranscriptionSidecar {
   final TranscriptStatus status;
   final String? transcript;
+  final String? summary;
+  final String? title;
   final String? language;
+  final int? durationMs;
 
   const TranscriptionSidecar({
     required this.status,
     this.transcript,
+    this.summary,
+    this.title,
     this.language,
+    this.durationMs,
   });
 
   static const idle = TranscriptionSidecar(status: TranscriptStatus.idle);
@@ -33,7 +36,10 @@ class TranscriptionSidecar {
     return TranscriptionSidecar(
       status: status,
       transcript: json['transcript'] as String?,
+      summary: json['summary'] as String?,
+      title: json['title'] as String?,
       language: json['language'] as String?,
+      durationMs: json['durationMs'] as int?,
     );
   }
 
@@ -45,17 +51,38 @@ class TranscriptionSidecar {
       TranscriptStatus.idle => 'idle',
     },
     'transcript': transcript,
+    'summary': summary,
+    'title': title,
     'language': language,
+    'durationMs': durationMs,
   };
+
+  TranscriptionSidecar copyWith({
+    TranscriptStatus? status,
+    String? transcript,
+    String? summary,
+    String? title,
+    String? language,
+    int? durationMs,
+  }) {
+    return TranscriptionSidecar(
+      status: status ?? this.status,
+      transcript: transcript ?? this.transcript,
+      summary: summary ?? this.summary,
+      title: title ?? this.title,
+      language: language ?? this.language,
+      durationMs: durationMs ?? this.durationMs,
+    );
+  }
 }
 
 class TranscriptionService {
   TranscriptionService._();
 
-  // static const String _modelAssetPath = 'assets/models/ggml-base.bin';
-  static const String _modelAssetPath = 'assets/models/ggml-tiny.bin';
-
-  static String? _modelDir; // cached after first copy
+  static final _model = GenerativeModel(
+    model: 'gemini-2.5-flash-lite', // current free-tier model
+    apiKey: kGeminiApiKey,
+  );
 
   // ─── Sidecar helpers ──────────────────────────────────────────────────────
 
@@ -98,120 +125,393 @@ class TranscriptionService {
       debugPrint('[TranscriptionService] deleteSidecar error: $e');
     }
   }
-
-  // ─── Model setup ──────────────────────────────────────────────────────────
-
-  /// Copies model from assets → library dir once, returns the dir path.
-  static Future<String> _ensureModelReady() async {
-    if (_modelDir != null) return _modelDir!;
-
-    final Directory libDir = Platform.isAndroid
-        ? await getApplicationSupportDirectory()
-        : await getLibraryDirectory();
-
-    // final modelFile = File('${libDir.path}/ggml-base.bin');
-    final modelFile = File('${libDir.path}/ggml-tiny.bin');
-
-    if (!await modelFile.exists()) {
-      debugPrint('[TranscriptionService] Copying model from assets...');
-      final byteData = await rootBundle.load(_modelAssetPath);
-      await modelFile.writeAsBytes(byteData.buffer.asUint8List());
-      debugPrint('[TranscriptionService] Model ready at ${modelFile.path}');
-    } else {
-      debugPrint('[TranscriptionService] Model already exists, skipping copy.');
-    }
-
-    _modelDir = libDir.path;
-    return _modelDir!;
-  }
-
   // ─── Main entry point ─────────────────────────────────────────────────────
 
-static Future<String> transcribeFile(
-  String audioPath, {
-  String? languageCode,
-}) async {
-  final file = File(audioPath);
-  if (!await file.exists()) {
-    throw Exception('Audio file not found: $audioPath');
+  static Future<TranscriptionResult> transcribeFile(
+    String audioPath, {
+    String? languageCode,
+    int retries = 3,
+  }) async {
+    for (int attempt = 0; attempt < retries; attempt++) {
+      try {
+        return await _doTranscribe(audioPath, languageCode: languageCode);
+      } catch (e) {
+        if (attempt == retries - 1) rethrow;
+        final waitSeconds = 40 * (attempt + 1);
+        debugPrint(
+          '[TranscriptionService] Rate limited, retrying in ${waitSeconds}s (attempt ${attempt + 1}/$retries)...',
+        );
+        await Future.delayed(Duration(seconds: waitSeconds));
+      }
+    }
+    throw Exception('All retries exhausted');
   }
 
-  // Always re-encode to ensure correct 16kHz mono 16-bit PCM
-  final wavPath = await _ensureWav(audioPath);
+  static Future<TranscriptionResult> _doTranscribe(
+    String audioPath, {
+    String? languageCode,
+  }) async {
+    final file = File(audioPath);
+    if (!await file.exists()) {
+      throw Exception('Audio file not found: $audioPath');
+    }
 
-  final sizeInMB = File(wavPath).lengthSync() / (1024 * 1024);
-  debugPrint('[TranscriptionService] File size: ${sizeInMB.toStringAsFixed(1)}MB');
-  debugPrint('[TranscriptionService] Starting on-device transcription...');
-
-  return _transcribeOnDevice(wavPath, languageCode: languageCode);
-}
-
-
-
-static Future<String> _ensureWav(String audioPath) async {
-  final supportDir = await getApplicationSupportDirectory();
-  final whisperInput = '${supportDir.path}/whisper_input.wav';
-
-  final ext = audioPath.split('.').last.toLowerCase();
-
-  if (ext == 'wav') {
-    // Re-encode to ensure correct 16kHz mono 16-bit PCM format
-    await AudioDecoder.convertToWav(
-      audioPath,
-      whisperInput,
-      sampleRate: 16000,
-      channels: 1,
+    final sizeInMB = file.lengthSync() / (1024 * 1024);
+    debugPrint(
+      '[TranscriptionService] File size: ${sizeInMB.toStringAsFixed(1)}MB',
     );
-  } else {
-    await AudioDecoder.convertToWav(
-      audioPath,
-      whisperInput,
-      sampleRate: 16000,
-      channels: 1,
+    debugPrint('[TranscriptionService] Sending to Gemini...');
+
+    final audioBytes = await file.readAsBytes();
+    final ext = audioPath.split('.').last.toLowerCase();
+    final mimeType = _mimeType(ext);
+
+    final languageInstruction = languageCode != null
+        ? 'The audio is in language code "$languageCode". Transcribe in that language.'
+        : 'Auto-detect the language and transcribe in the original language.';
+
+    // final prompt = '''
+    // Transcribe the full audio word by word. Be accurate.
+    // Identify each distinct speaker as "Speaker 1", "Speaker 2", etc.
+    // Format each line as [Speaker N]: <spoken text>
+    // Be consistent with speaker labels throughout.
+    // Return ONLY the transcript, nothing else. No JSON, no summary, just speaker-labeled lines.
+    // $languageInstruction
+    // ''';
+
+    final prompt = '''
+You are an intelligent audio analyst. Listen to the entire audio carefully.
+
+Return your response in EXACTLY this format (no extra text before or after):
+
+TITLE: <a concise title, maximum 5 words, no punctuation, no markdown>
+
+---SUMMARY---
+
+## Overview
+Write 2-3 concise sentences describing the overall purpose and context of the recording.
+
+## Key Topics
+- Topic: Brief explanation
+
+(List every major topic. Do not invent topics.)
+
+## Decisions Made
+- Decision
+
+(Include ONLY if decisions were actually made.)
+
+## Action Items
+- Task — Owner — Deadline
+
+(Include ONLY if tasks were assigned. Never invent owner or deadline.)
+
+## Important Notes
+- Key facts, numbers, names, risks mentioned.
+
+(Include ONLY if such information exists.)
+
+## Follow-ups
+- Open questions or unresolved items.
+
+(Include ONLY if something remains unresolved.)
+
+Rules:
+- Focus on WHAT was discussed, not WHO said it.
+- Do not fabricate any information.
+- Remove filler, greetings, repetitions.
+- Preserve exact numbers, names, and technical terms.
+- For personal notes or journals, summarize naturally without forcing meeting-style sections.
+
+$languageInstruction
+''';
+
+    final response = await _model.generateContent([
+      Content.multi([DataPart(mimeType, audioBytes), TextPart(prompt)]),
+    ]);
+
+    final raw = response.text ?? '';
+    debugPrint('[TranscriptionService] Gemini raw response: $raw');
+
+    return _parseResponse(raw);
+  }
+
+  // ─── Parse Gemini response ────────────────────────────────────────────────
+
+  static TranscriptionResult _parseResponse(String raw) {
+    String title = '';
+    String summary = raw.trim();
+
+    // Extract TITLE line
+    final titleMatch = RegExp(
+      r'^TITLE:\s*(.+)$',
+      multiLine: true,
+      caseSensitive: false,
+    ).firstMatch(raw);
+    if (titleMatch != null) {
+      title = titleMatch.group(1)?.trim() ?? '';
+      // Remove markdown noise from title just in case
+      title = title.replaceAll(RegExp(r'[#*`_]'), '').trim();
+    }
+
+    // Strip the TITLE line and the separator from the summary
+    summary = raw
+        .replaceAll(RegExp(r'^TITLE:.*$', multiLine: true), '')
+        .replaceAll('---SUMMARY---', '')
+        .trim();
+
+    return TranscriptionResult(
+      transcript: '',
+      summary: summary,
+      title: title,
+      language: '',
     );
   }
 
-  debugPrint('[TranscriptionService] WAV ready at: $whisperInput');
-  return whisperInput;
+  // ─── MIME type helper ─────────────────────────────────────────────────────
+
+  static String _mimeType(String ext) {
+    return switch (ext) {
+      'mp3' => 'audio/mp3',
+      'wav' => 'audio/wav',
+      'aac' => 'audio/aac',
+      'ogg' => 'audio/ogg',
+      'flac' => 'audio/flac',
+      _ => 'audio/m4a', // default for m4a, aac, mp4 audio
+    };
+  }
 }
 
-  // ─── On-device Whisper ────────────────────────────────────────────────────
+class TranscriptionResult {
+  final String transcript;
+  final String summary;
+  final String title;
+  final String language;
 
-static Future<String> _transcribeOnDevice(
-  String audioPath, {
-  String? languageCode,
-}) async {
-
-    // Check file duration
-  final fileSizeBytes = File(audioPath).lengthSync();
-  // At 16kHz mono 16-bit: bytes / (16000 * 2) = seconds
-  final estimatedSeconds = fileSizeBytes / (16000 * 2);
-  debugPrint('[TranscriptionService] Estimated duration: ${estimatedSeconds.toStringAsFixed(1)}s');
-  debugPrint('[TranscriptionService] Chunks needed: ${(estimatedSeconds / 30).ceil()}');
-
-
-
-  final modelDir = await _ensureModelReady();
-
-  final whisper = Whisper(
-    model: WhisperModel.tiny,   // ← match your .bin file name
-    modelDir: modelDir,         // ← it looks for ggml-tiny.bin here
-  );
-
-  final response = await whisper.transcribe(
-    transcribeRequest: TranscribeRequest(
-      audio: audioPath,
-      isTranslate: false,
-      language: languageCode ?? 'auto',
-    ),
-  );
-
-  final text = response.text?.trim() ?? '';
-  debugPrint('[TranscriptionService] Whisper done: $text');
-  return text;
+  const TranscriptionResult({
+    required this.transcript,
+    required this.summary,
+    this.title = '',
+    required this.language,
+  });
 }
 
-}
+
+// LLM
+// import 'dart:convert';
+// import 'dart:io';
+// import 'package:flutter/foundation.dart';
+// import 'package:flutter/services.dart';
+// import 'package:path_provider/path_provider.dart';
+// import 'package:whisper_flutter_new/whisper_flutter_new.dart';
+// import '../constants.dart';
+// import 'package:audio_decoder/audio_decoder.dart';
+
+// enum TranscriptStatus { idle, pending, done, failed }
+
+// class TranscriptionSidecar {
+//   final TranscriptStatus status;
+//   final String? transcript;
+//   final String? language;
+
+//   const TranscriptionSidecar({
+//     required this.status,
+//     this.transcript,
+//     this.language,
+//   });
+
+//   static const idle = TranscriptionSidecar(status: TranscriptStatus.idle);
+
+//   factory TranscriptionSidecar.fromJson(Map<String, dynamic> json) {
+//     final statusStr = json['status'] as String? ?? 'idle';
+//     final status = switch (statusStr) {
+//       'done' => TranscriptStatus.done,
+//       'pending' => TranscriptStatus.pending,
+//       'failed' => TranscriptStatus.failed,
+//       _ => TranscriptStatus.idle,
+//     };
+//     return TranscriptionSidecar(
+//       status: status,
+//       transcript: json['transcript'] as String?,
+//       language: json['language'] as String?,
+//     );
+//   }
+
+//   Map<String, dynamic> toJson() => {
+//     'status': switch (status) {
+//       TranscriptStatus.done => 'done',
+//       TranscriptStatus.pending => 'pending',
+//       TranscriptStatus.failed => 'failed',
+//       TranscriptStatus.idle => 'idle',
+//     },
+//     'transcript': transcript,
+//     'language': language,
+//   };
+// }
+
+// class TranscriptionService {
+//   TranscriptionService._();
+
+//   // static const String _modelAssetPath = 'assets/models/ggml-base.bin';
+//   static const String _modelAssetPath = 'assets/models/ggml-tiny.bin';
+
+//   static String? _modelDir; // cached after first copy
+
+//   // ─── Sidecar helpers ──────────────────────────────────────────────────────
+
+//   static String sidecarPath(String audioPath) {
+//     final dotIndex = audioPath.lastIndexOf('.');
+//     if (dotIndex == -1) return '$audioPath.json';
+//     return '${audioPath.substring(0, dotIndex)}.json';
+//   }
+
+//   static Future<TranscriptionSidecar> loadSidecar(String audioPath) async {
+//     try {
+//       final file = File(sidecarPath(audioPath));
+//       if (!await file.exists()) return TranscriptionSidecar.idle;
+//       final content = await file.readAsString();
+//       final json = jsonDecode(content) as Map<String, dynamic>;
+//       return TranscriptionSidecar.fromJson(json);
+//     } catch (e) {
+//       debugPrint('[TranscriptionService] loadSidecar error: $e');
+//       return TranscriptionSidecar.idle;
+//     }
+//   }
+
+//   static Future<void> saveSidecar(
+//     String audioPath,
+//     TranscriptionSidecar sidecar,
+//   ) async {
+//     try {
+//       final file = File(sidecarPath(audioPath));
+//       await file.writeAsString(jsonEncode(sidecar.toJson()));
+//     } catch (e) {
+//       debugPrint('[TranscriptionService] saveSidecar error: $e');
+//     }
+//   }
+
+//   static Future<void> deleteSidecar(String audioPath) async {
+//     try {
+//       final file = File(sidecarPath(audioPath));
+//       if (await file.exists()) await file.delete();
+//     } catch (e) {
+//       debugPrint('[TranscriptionService] deleteSidecar error: $e');
+//     }
+//   }
+
+//   // ─── Model setup ──────────────────────────────────────────────────────────
+
+//   /// Copies model from assets → library dir once, returns the dir path.
+//   static Future<String> _ensureModelReady() async {
+//     if (_modelDir != null) return _modelDir!;
+
+//     final Directory libDir = Platform.isAndroid
+//         ? await getApplicationSupportDirectory()
+//         : await getLibraryDirectory();
+
+//     // final modelFile = File('${libDir.path}/ggml-base.bin');
+//     final modelFile = File('${libDir.path}/ggml-tiny.bin');
+
+//     if (!await modelFile.exists()) {
+//       debugPrint('[TranscriptionService] Copying model from assets...');
+//       final byteData = await rootBundle.load(_modelAssetPath);
+//       await modelFile.writeAsBytes(byteData.buffer.asUint8List());
+//       debugPrint('[TranscriptionService] Model ready at ${modelFile.path}');
+//     } else {
+//       debugPrint('[TranscriptionService] Model already exists, skipping copy.');
+//     }
+
+//     _modelDir = libDir.path;
+//     return _modelDir!;
+//   }
+
+//   // ─── Main entry point ─────────────────────────────────────────────────────
+
+// static Future<String> transcribeFile(
+//   String audioPath, {
+//   String? languageCode,
+// }) async {
+//   final file = File(audioPath);
+//   if (!await file.exists()) {
+//     throw Exception('Audio file not found: $audioPath');
+//   }
+
+//   // Always re-encode to ensure correct 16kHz mono 16-bit PCM
+//   final wavPath = await _ensureWav(audioPath);
+
+//   final sizeInMB = File(wavPath).lengthSync() / (1024 * 1024);
+//   debugPrint('[TranscriptionService] File size: ${sizeInMB.toStringAsFixed(1)}MB');
+//   debugPrint('[TranscriptionService] Starting on-device transcription...');
+
+//   return _transcribeOnDevice(wavPath, languageCode: languageCode);
+// }
+
+
+
+// static Future<String> _ensureWav(String audioPath) async {
+//   final supportDir = await getApplicationSupportDirectory();
+//   final whisperInput = '${supportDir.path}/whisper_input.wav';
+
+//   final ext = audioPath.split('.').last.toLowerCase();
+
+//   if (ext == 'wav') {
+//     // Re-encode to ensure correct 16kHz mono 16-bit PCM format
+//     await AudioDecoder.convertToWav(
+//       audioPath,
+//       whisperInput,
+//       sampleRate: 16000,
+//       channels: 1,
+//     );
+//   } else {
+//     await AudioDecoder.convertToWav(
+//       audioPath,
+//       whisperInput,
+//       sampleRate: 16000,
+//       channels: 1,
+//     );
+//   }
+
+//   debugPrint('[TranscriptionService] WAV ready at: $whisperInput');
+//   return whisperInput;
+// }
+
+//   // ─── On-device Whisper ────────────────────────────────────────────────────
+
+// static Future<String> _transcribeOnDevice(
+//   String audioPath, {
+//   String? languageCode,
+// }) async {
+
+//     // Check file duration
+//   final fileSizeBytes = File(audioPath).lengthSync();
+//   // At 16kHz mono 16-bit: bytes / (16000 * 2) = seconds
+//   final estimatedSeconds = fileSizeBytes / (16000 * 2);
+//   debugPrint('[TranscriptionService] Estimated duration: ${estimatedSeconds.toStringAsFixed(1)}s');
+//   debugPrint('[TranscriptionService] Chunks needed: ${(estimatedSeconds / 30).ceil()}');
+
+
+
+//   final modelDir = await _ensureModelReady();
+
+//   final whisper = Whisper(
+//     model: WhisperModel.tiny,   // ← match your .bin file name
+//     modelDir: modelDir,         // ← it looks for ggml-tiny.bin here
+//   );
+
+//   final response = await whisper.transcribe(
+//     transcribeRequest: TranscribeRequest(
+//       audio: audioPath,
+//       isTranslate: false,
+//       language: languageCode ?? 'auto',
+//     ),
+//   );
+
+//   final text = response.text?.trim() ?? '';
+//   debugPrint('[TranscriptionService] Whisper done: $text');
+//   return text;
+// }
+
+// }
 
 // Groq
 
