@@ -16,6 +16,8 @@ import '../models/recording.dart';
 import '../constants.dart';
 import 'background_service.dart';
 import 'transcription_service.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
 
 class RecorderService extends ChangeNotifier {
   static final RecorderService _instance = RecorderService._internal();
@@ -68,7 +70,9 @@ class RecorderService extends ChangeNotifier {
         notifyListeners();
         loadRecordings().then((_) {
           if (_currentRecordingPath != null) {
-            TranscriptionService.loadSidecar(_currentRecordingPath!).then((sidecar) {
+            TranscriptionService.loadSidecar(_currentRecordingPath!).then((
+              sidecar,
+            ) {
               if (sidecar.status == TranscriptStatus.idle) {
                 _triggerTranscription(_currentRecordingPath!);
               }
@@ -283,7 +287,8 @@ class RecorderService extends ChangeNotifier {
       final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
       final ext = sourcePath.split('.').last.toLowerCase();
 
-      final destPath = '${recordingsDir.path}/REC_${timestamp}_${durationMs}.$ext';
+      final destPath =
+          '${recordingsDir.path}/REC_${timestamp}_${durationMs}.$ext';
 
       final sourceFile = File(sourcePath);
       await sourceFile.copy(destPath);
@@ -295,11 +300,107 @@ class RecorderService extends ChangeNotifier {
       debugPrint('[RecorderService] importFile error: $e');
       return false;
     }
-  }
-
-  // ---------------------------------------------------------------------------
+  } // ---------------------------------------------------------------------------
   // Transcription orchestration
   // ---------------------------------------------------------------------------
+
+  /// Runs FFmpeg to remove silence and very low volume periods from the audio file.
+  Future<String> removeSilence(String inputPath) async {
+    final completer = Completer<String>();
+
+    final dotIndex = inputPath.lastIndexOf('.');
+    final outputPath = dotIndex != -1
+        ? '${inputPath.substring(0, dotIndex)}_clean${inputPath.substring(dotIndex)}'
+        : '${inputPath}_clean';
+
+    final probeArgs = [
+      '-i',
+      inputPath,
+      '-af',
+      'volumedetect',
+      '-f',
+      'null',
+      '-',
+    ];
+    await FFmpegKit.executeWithArgumentsAsync(probeArgs, (session) async {
+      final logs = await session.getAllLogsAsString();
+      debugPrint('[VolumeDetect] $logs');
+    });
+
+    final arguments = [
+      '-y',
+      '-i',
+      inputPath,
+      '-af',
+      // 'silenceremove=start_periods=1:start_duration=0.3:start_threshold=-35dB:stop_periods=-1:stop_duration=0.5:stop_threshold=-35dB',
+      'afftdn=nf=-25,silenceremove=start_periods=1:start_duration=0.3:start_threshold=-35dB:stop_periods=-1:stop_duration=0.5:stop_threshold=-35dB',
+      outputPath,
+    ];
+
+    debugPrint('[RecorderService] Starting silence removal for: $inputPath');
+    try {
+      await FFmpegKit.executeWithArgumentsAsync(arguments, (session) async {
+        final returnCode = await session.getReturnCode();
+        if (ReturnCode.isSuccess(returnCode)) {
+          // Calculate statistics
+          final inputSize = File(inputPath).existsSync()
+              ? File(inputPath).lengthSync()
+              : 0;
+          final outputSize = File(outputPath).existsSync()
+              ? File(outputPath).lengthSync()
+              : 0;
+
+          int inputDurationMs = 0;
+          int outputDurationMs = 0;
+          try {
+            final player = AudioPlayer();
+            final inputDur = await player.setFilePath(inputPath);
+            inputDurationMs = inputDur?.inMilliseconds ?? 0;
+            final outputDur = await player.setFilePath(outputPath);
+            outputDurationMs = outputDur?.inMilliseconds ?? 0;
+            await player.dispose();
+          } catch (e) {
+            debugPrint('[RecorderService] Error probing duration: $e');
+          }
+
+          debugPrint(
+            '[RecorderService] Silence removal completed successfully:',
+          );
+          debugPrint(
+            '  - Original File: $inputPath (${(inputSize / 1024).toStringAsFixed(1)} KB, ${(inputDurationMs / 1000).toStringAsFixed(2)}s)',
+          );
+          debugPrint(
+            '  - Cleaned File: $outputPath (${(outputSize / 1024).toStringAsFixed(1)} KB, ${(outputDurationMs / 1000).toStringAsFixed(2)}s)',
+          );
+          if (inputSize > 0 && inputDurationMs > 0) {
+            final sizeReduction = ((1 - outputSize / inputSize) * 100)
+                .toStringAsFixed(1);
+            final durationReduction =
+                ((1 - outputDurationMs / inputDurationMs) * 100)
+                    .toStringAsFixed(1);
+            debugPrint(
+              '  - Reduction: Size: $sizeReduction% | Duration: $durationReduction%',
+            );
+          }
+
+          completer.complete(outputPath);
+        } else {
+          final failCode = returnCode?.getValue();
+          debugPrint(
+            '[RecorderService] FFmpeg failed with return code: $failCode',
+          );
+          // Fallback: return original inputPath so transcription still proceeds
+          completer.complete(inputPath);
+        }
+      });
+    } catch (e) {
+      debugPrint('[RecorderService] FFmpeg execution exception: $e');
+      // Fallback: return original inputPath
+      completer.complete(inputPath);
+    }
+
+    return completer.future;
+  }
 
   /// Starts a transcription job for [audioPath].
   ///
@@ -310,56 +411,121 @@ class RecorderService extends ChangeNotifier {
 
     final languageCode = _selectedLanguage.apiCode;
 
-    TranscriptionService.transcribeFile(audioPath, languageCode: languageCode)
-        .then((result) {
-          final rec = _findByPath(audioPath);
-          final sidecar = TranscriptionSidecar(
-            status: TranscriptStatus.done,
-            transcript: result.transcript,
-            summary: result.summary,
-            title: result.title.isNotEmpty ? result.title : null,
-            language: result.language.isNotEmpty
-                ? result.language
-                : languageCode,
-            durationMs: rec?.duration.inMilliseconds,
-          );
-          TranscriptionService.saveSidecar(audioPath, sidecar);
-          _applyTranscriptSidecar(audioPath, sidecar);
+    removeSilence(audioPath).then((cleanAudioPath) async {
+      // ── Guard: skip transcription if cleaned file is too short ──
+      final cleanFile = File(cleanAudioPath);
+      if (!cleanFile.existsSync()) {
+        debugPrint(
+          '[RecorderService] Clean file missing, skipping transcription.',
+        );
+        if (cleanAudioPath != audioPath) cleanFile.deleteSync();
+        return;
+      }
 
-          // ── Auto-rename using AI title (preferred) or first 6 words of summary ──
-          String? renameTarget;
-          if (result.title.isNotEmpty) {
-            // Use the AI title directly
-            renameTarget = result.title
-                .replaceAll(RegExp(r'[^\w\s]'), '')
-                .trim()
-                .replaceAll(RegExp(r'\s+'), '_');
-          } else if (result.summary.isNotEmpty) {
-            // Fallback: first 6 clean words
-            renameTarget = result.summary
-                .replaceAll(RegExp(r'[^\w\s]'), '')
-                .trim()
-                .split(RegExp(r'\s+'))
-                .where((w) => w.isNotEmpty)
-                .take(6)
-                .join('_');
-          }
-          if (renameTarget != null && renameTarget.isNotEmpty) {
+      // Probe cleaned file duration
+      int cleanDurationMs = 0;
+      try {
+        final probe = AudioPlayer();
+        final dur = await probe.setFilePath(cleanAudioPath);
+        cleanDurationMs = dur?.inMilliseconds ?? 0;
+        await probe.dispose();
+      } catch (e) {
+        debugPrint('[RecorderService] Error probing clean file duration: $e');
+      }
+
+      if (cleanDurationMs < 10000) {
+        debugPrint(
+          '[RecorderService] Cleaned file too short (${cleanDurationMs}ms), skipping transcription.',
+        );
+        final rec = _findByPath(audioPath);
+        final sidecar = TranscriptionSidecar(
+          status: TranscriptStatus.done,
+          transcript: '',
+          summary: '',
+          title: null,
+          language: languageCode,
+          durationMs: rec?.duration.inMilliseconds,
+        );
+        TranscriptionService.saveSidecar(audioPath, sidecar);
+        _applyTranscriptSidecar(audioPath, sidecar);
+        if (cleanAudioPath != audioPath && cleanFile.existsSync()) {
+          cleanFile.deleteSync();
+        }
+        return;
+      }
+
+      debugPrint(
+        '[RecorderService] Sending audio to transcription service: $cleanAudioPath',
+      );
+      TranscriptionService.transcribeFile(
+            cleanAudioPath,
+            languageCode: languageCode,
+          )
+          .then((result) {
             final rec = _findByPath(audioPath);
-            if (rec != null) renameRecording(rec, renameTarget);
-          }
-        })
-        .catchError((Object err) {
-          debugPrint('[RecorderService] Transcription failed: $err');
-          final rec = _findByPath(audioPath);
-          final sidecar = TranscriptionSidecar(
-            status: TranscriptStatus.failed,
-            language: languageCode,
-            durationMs: rec?.duration.inMilliseconds,
-          );
-          TranscriptionService.saveSidecar(audioPath, sidecar);
-          _applyTranscriptSidecar(audioPath, sidecar);
-        });
+            final sidecar = TranscriptionSidecar(
+              status: TranscriptStatus.done,
+              transcript: result.transcript,
+              summary: result.summary,
+              title: result.title.isNotEmpty ? result.title : null,
+              language: result.language.isNotEmpty
+                  ? result.language
+                  : languageCode,
+              durationMs: rec?.duration.inMilliseconds,
+            );
+            TranscriptionService.saveSidecar(audioPath, sidecar);
+            _applyTranscriptSidecar(audioPath, sidecar);
+
+            // ── Auto-rename using AI title (preferred) or first 6 words of summary ──
+            String? renameTarget;
+            if (result.title.isNotEmpty) {
+              renameTarget = result.title
+                  .replaceAll(RegExp(r'[^\w\s]'), '')
+                  .trim()
+                  .replaceAll(RegExp(r'\s+'), '_');
+            } else if (result.summary.isNotEmpty) {
+              renameTarget = result.summary
+                  .replaceAll(RegExp(r'[^\w\s]'), '')
+                  .trim()
+                  .split(RegExp(r'\s+'))
+                  .where((w) => w.isNotEmpty)
+                  .take(6)
+                  .join('_');
+            }
+            if (renameTarget != null && renameTarget.isNotEmpty) {
+              final rec = _findByPath(audioPath);
+              if (rec != null) renameRecording(rec, renameTarget);
+            }
+          })
+          .catchError((Object err) {
+            debugPrint('[RecorderService] Transcription failed: $err');
+            final rec = _findByPath(audioPath);
+            final sidecar = TranscriptionSidecar(
+              status: TranscriptStatus.failed,
+              language: languageCode,
+              durationMs: rec?.duration.inMilliseconds,
+            );
+            TranscriptionService.saveSidecar(audioPath, sidecar);
+            _applyTranscriptSidecar(audioPath, sidecar);
+          })
+          .whenComplete(() {
+            if (cleanAudioPath != audioPath) {
+              try {
+                final cleanFile = File(cleanAudioPath);
+                if (cleanFile.existsSync()) {
+                  cleanFile.deleteSync();
+                  debugPrint(
+                    '[RecorderService] Deleted temporary clean file: $cleanAudioPath',
+                  );
+                }
+              } catch (e) {
+                debugPrint(
+                  '[RecorderService] Error deleting temporary clean file: $e',
+                );
+              }
+            }
+          });
+    });
   }
 
   Future<void> renameRecording(Recording recording, String newName) async {
@@ -461,12 +627,16 @@ class RecorderService extends ChangeNotifier {
                 if (duration != null) {
                   rec.duration = duration;
                   // Save duration to sidecar so we don't have to probe it again next time
-                  sidecar = sidecar.copyWith(durationMs: duration.inMilliseconds);
+                  sidecar = sidecar.copyWith(
+                    durationMs: duration.inMilliseconds,
+                  );
                   await TranscriptionService.saveSidecar(file.path, sidecar);
                 }
                 await probe.dispose();
               } catch (e) {
-                debugPrint('[RecorderService] Probe duration error for ${file.path}: $e');
+                debugPrint(
+                  '[RecorderService] Probe duration error for ${file.path}: $e',
+                );
               }
             }
 

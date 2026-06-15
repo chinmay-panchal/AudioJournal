@@ -49,6 +49,7 @@ dependencies:
   audio_decoder: ^0.8.1
   google_generative_ai: ^0.4.7
   share_plus: ^10.1.4
+  ffmpeg_kit_flutter_new_audio: ^2.0.0
 
 
 dev_dependencies:
