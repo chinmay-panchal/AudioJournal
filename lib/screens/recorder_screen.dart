@@ -7,20 +7,32 @@ import 'package:share_plus/share_plus.dart';
 import '../models/recording.dart';
 import '../services/recorder_service.dart';
 import '../services/transcription_service.dart';
+import '../services/auth_service.dart';
+import '../services/api_service.dart';
 import '../widgets/waveform_widget.dart';
 
 // ─────────────────────────── Palette ────────────────────────────────────────
-const _bgDeep   = Color(0xFF0A0E1A);
-const _bgCard   = Color(0xFF111827);
-const _surface  = Color(0xFF1C2437);
+const _bgDeep = Color(0xFF0A0E1A);
+const _bgCard = Color(0xFF111827);
+const _surface = Color(0xFF1C2437);
 const _surface2 = Color(0xFF243044);
-const _accent   = Color(0xFF6366F1); // indigo
+const _accent = Color(0xFF6366F1); // indigo
 const _accentLt = Color(0xFF818CF8);
-const _danger   = Color(0xFFEF4444);
+const _danger = Color(0xFFEF4444);
 const _textPrim = Colors.white;
-const _textSec  = Color(0xFF9CA3AF);
-const _textMut  = Color(0xFF6B7280);
+const _textSec = Color(0xFF9CA3AF);
+const _textMut = Color(0xFF6B7280);
 // ─────────────────────────────────────────────────────────────────────────────
+
+// =============================================================================
+// Simple model for transcript list items from /transcribe
+// =============================================================================
+class _TranscriptItem {
+  final String id;
+  final String title;
+
+  const _TranscriptItem({required this.id, required this.title});
+}
 
 class RecorderScreen extends StatefulWidget {
   const RecorderScreen({super.key});
@@ -71,19 +83,20 @@ class _RecorderScreenState extends State<RecorderScreen>
       }
     });
 
-    _audioPlayer.positionStream.listen(
-      (pos) { if (mounted) setState(() => _playPosition = pos); },
-    );
-    _audioPlayer.durationStream.listen(
-      (dur) { if (mounted) setState(() => _playDuration = dur ?? Duration.zero); },
-    );
+    _audioPlayer.positionStream.listen((pos) {
+      if (mounted) setState(() => _playPosition = pos);
+    });
+    _audioPlayer.durationStream.listen((dur) {
+      if (mounted) setState(() => _playDuration = dur ?? Duration.zero);
+    });
   }
 
   void _onRecorderServiceChange() {
     if (mounted) {
       setState(() {
         if (_recorderService.isRecording) {
-          if (!_pulseController.isAnimating) _pulseController.repeat(reverse: true);
+          if (!_pulseController.isAnimating)
+            _pulseController.repeat(reverse: true);
         } else {
           _pulseController.stop();
           _pulseController.value = 0.0;
@@ -108,7 +121,10 @@ class _RecorderScreenState extends State<RecorderScreen>
     } else {
       if (_isPlaying) {
         await _audioPlayer.stop();
-        setState(() { _isPlaying = false; _playingPath = null; });
+        setState(() {
+          _isPlaying = false;
+          _playingPath = null;
+        });
       }
       try {
         await _recorderService.startRecording();
@@ -139,7 +155,8 @@ class _RecorderScreenState extends State<RecorderScreen>
         await _audioPlayer.play();
       } catch (e) {
         debugPrint('Playback error: $e');
-        if (mounted) _showToast('Playback failed. File may be missing.', isError: true);
+        if (mounted)
+          _showToast('Playback failed. File may be missing.', isError: true);
       }
     }
   }
@@ -168,6 +185,145 @@ class _RecorderScreenState extends State<RecorderScreen>
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         margin: const EdgeInsets.all(16),
         duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  Future<void> _handleLogout() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      barrierColor: Colors.black54,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _surface,
+        title: const Text(
+          'Logout',
+          style: TextStyle(color: _textPrim, fontWeight: FontWeight.bold),
+        ),
+        content: const Text(
+          'Are you sure you want to log out?',
+          style: TextStyle(color: _textSec),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel', style: TextStyle(color: _textMut)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(
+              'Logout',
+              style: TextStyle(color: _danger, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      await _audioPlayer.stop();
+      if (mounted) {
+        setState(() {
+          _isPlaying = false;
+          _playingPath = null;
+        });
+      }
+      await AuthService().logout();
+    }
+  }
+
+  // ── Combine & Summarize ───────────────────────────────────────────────────
+
+  Future<void> _showCombineSheet() async {
+    // 1. Fetch transcript list
+    List<_TranscriptItem> items = [];
+    try {
+      final resp = await ApiService().get('/transcribe');
+      final data = resp.data;
+      if (data is Map<String, dynamic> && data['transcripts'] is List) {
+        for (final t in data['transcripts'] as List) {
+          if (t is Map<String, dynamic>) {
+            final id = t['transcript_id']?.toString() ?? '';
+            final rawTitle = t['title']?.toString() ?? '';
+            final title = rawTitle.isEmpty || rawTitle == 'Untitled Transcript'
+                ? 'Untitled (${id.substring(0, 8)})'
+                : rawTitle;
+            if (id.isNotEmpty) items.add(_TranscriptItem(id: id, title: title));
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('[CombineSheet] fetch error: $e');
+      if (mounted) _showToast('Failed to load transcripts', isError: true);
+      return;
+    }
+
+    if (items.isEmpty) {
+      if (mounted) _showToast('No transcripts found');
+      return;
+    }
+
+    if (!mounted) return;
+
+    // 2. Show bottom sheet with stateful checkbox list
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => _CombineSheet(
+        items: items,
+        onGenerate: (selectedIds) async {
+          Navigator.pop(ctx);
+          await _generateCombinedSummary(selectedIds);
+        },
+      ),
+    );
+  }
+
+  Future<void> _generateCombinedSummary(List<String> ids) async {
+    // Show loading indicator
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      barrierColor: Colors.black54,
+      builder: (_) => const _LoadingDialog(),
+    );
+
+    try {
+      final resp = await ApiService().post(
+        '/summary/custom',
+        data: {'transcript_ids': ids},
+      );
+
+      if (!mounted) return;
+      Navigator.pop(context); // dismiss loading
+
+      final body = resp.data;
+      if (body is Map<String, dynamic>) {
+        final title = body['title']?.toString() ?? 'Combined Summary';
+        final summaryText = body['summary_text']?.toString() ?? '';
+        _showSummaryResultDialog(title, summaryText);
+      }
+    } catch (e) {
+      debugPrint('[CombineSummary] error: $e');
+      if (mounted) {
+        Navigator.pop(context); // dismiss loading
+        _showToast('Failed to generate summary', isError: true);
+      }
+    }
+  }
+
+  void _showSummaryResultDialog(String title, String summaryText) {
+    showDialog(
+      context: context,
+      barrierColor: Colors.black54,
+      builder: (ctx) => _SummaryResultDialog(
+        title: title,
+        summaryText: summaryText,
+        onCopy: () {
+          Clipboard.setData(ClipboardData(text: '$title\n\n$summaryText'));
+          Navigator.pop(ctx);
+          _showToast('Summary copied');
+        },
       ),
     );
   }
@@ -210,9 +366,12 @@ class _RecorderScreenState extends State<RecorderScreen>
           child: Column(
             children: [
               // ── Top bar ──────────────────────────────────────────────────
-              _TopBar(onImport: isRecording ? null : _importFile),
+              _TopBar(
+                onImport: isRecording ? null : _importFile,
+                onLogout: isRecording ? null : _handleLogout,
+              ),
 
-              // ── Recorder section (fixed height, never overflows) ──────────
+              // ── Recorder section ─────────────────────────────────────────
               _RecorderSection(
                 isRecording: isRecording,
                 currentDuration: currentDuration,
@@ -235,12 +394,16 @@ class _RecorderScreenState extends State<RecorderScreen>
                   onDelete: _showDeleteConfirmation,
                   onShare: _shareRecording,
                   onSeek: (ms) => _audioPlayer.seek(Duration(milliseconds: ms)),
-                  onToggleExpand: (r) => setState(() => r.isExpanded = !r.isExpanded),
+                  onToggleExpand: (r) =>
+                      setState(() => r.isExpanded = !r.isExpanded),
                   onCopyTranscript: _copyTranscriptToClipboard,
-                  onRetryTranscription: (r) => _recorderService.retryTranscription(r),
-                  onRename: (r, name) => _recorderService.renameRecording(r, name),
+                  onRetryTranscription: (r) =>
+                      _recorderService.retryTranscription(r),
+                  onRename: (r, name) =>
+                      _recorderService.renameRecording(r, name),
                   formatDuration: _formatListDuration,
                   formatDate: _formatDate,
+                  onCombine: _showCombineSheet,
                 ),
               ),
             ],
@@ -266,14 +429,598 @@ class _RecorderScreenState extends State<RecorderScreen>
   Future<void> _shareRecording(Recording recording) async {
     try {
       final file = XFile(recording.path);
-      await Share.shareXFiles(
-        [file],
-        text: recording.title ?? _displayTitle(recording),
-      );
+      await Share.shareXFiles([
+        file,
+      ], text: recording.title ?? _displayTitle(recording));
     } catch (e) {
       debugPrint('[Share] Error: $e');
       if (mounted) _showToast('Could not share recording', isError: true);
     }
+  }
+}
+
+// =============================================================================
+// Combine Sheet  (stateful — needs checkboxes)
+// =============================================================================
+
+class _CombineSheet extends StatefulWidget {
+  final List<_TranscriptItem> items;
+  final void Function(List<String> selectedIds) onGenerate;
+
+  const _CombineSheet({required this.items, required this.onGenerate});
+
+  @override
+  State<_CombineSheet> createState() => _CombineSheetState();
+}
+
+class _CombineSheetState extends State<_CombineSheet> {
+  late final Set<String> _selected;
+
+  @override
+  void initState() {
+    super.initState();
+    // Start with nothing selected
+    _selected = {};
+  }
+
+  bool get _allSelected => _selected.length == widget.items.length;
+
+  void _toggleAll() {
+    setState(() {
+      if (_allSelected) {
+        _selected.clear();
+      } else {
+        _selected.addAll(widget.items.map((i) => i.id));
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomPad = MediaQuery.of(context).viewInsets.bottom;
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+      padding: EdgeInsets.only(bottom: bottomPad),
+      decoration: BoxDecoration(
+        color: _surface,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // ── Handle ────────────────────────────────────────────────────────
+          const SizedBox(height: 12),
+          Container(
+            width: 36,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Colors.white24,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // ── Header ────────────────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            child: Row(
+              children: [
+                Container(
+                  width: 34,
+                  height: 34,
+                  decoration: BoxDecoration(
+                    gradient: const LinearGradient(
+                      colors: [_accent, Color(0xFF7C3AED)],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Icon(
+                    Icons.auto_awesome_rounded,
+                    color: Colors.white,
+                    size: 17,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Combine & Summarize',
+                        style: TextStyle(
+                          color: _textPrim,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      Text(
+                        'Select recordings to combine into one summary',
+                        style: TextStyle(color: _textMut, fontSize: 11),
+                      ),
+                    ],
+                  ),
+                ),
+                // Select all toggle
+                GestureDetector(
+                  onTap: _toggleAll,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: _allSelected
+                          ? _accent.withValues(alpha: 0.18)
+                          : _surface2,
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: _allSelected ? _accentLt : Colors.white12,
+                      ),
+                    ),
+                    child: Text(
+                      _allSelected ? 'Deselect all' : 'Select all',
+                      style: TextStyle(
+                        color: _allSelected ? _accentLt : _textSec,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 12),
+          Container(height: 1, color: Colors.white.withValues(alpha: 0.06)),
+
+          // ── Checkbox list ─────────────────────────────────────────────────
+          ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(context).size.height * 0.38,
+            ),
+            child: ListView.builder(
+              shrinkWrap: true,
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              itemCount: widget.items.length,
+              itemBuilder: (ctx, i) {
+                final item = widget.items[i];
+                final checked = _selected.contains(item.id);
+                return InkWell(
+                  onTap: () => setState(() {
+                    checked
+                        ? _selected.remove(item.id)
+                        : _selected.add(item.id);
+                  }),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 10,
+                    ),
+                    child: Row(
+                      children: [
+                        AnimatedContainer(
+                          duration: const Duration(milliseconds: 180),
+                          width: 22,
+                          height: 22,
+                          decoration: BoxDecoration(
+                            color: checked ? _accent : Colors.transparent,
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(
+                              color: checked ? _accent : Colors.white24,
+                              width: 1.5,
+                            ),
+                          ),
+                          child: checked
+                              ? const Icon(
+                                  Icons.check_rounded,
+                                  color: Colors.white,
+                                  size: 14,
+                                )
+                              : null,
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Text(
+                            item.title,
+                            style: TextStyle(
+                              color: checked ? _textPrim : _textSec,
+                              fontSize: 13.5,
+                              fontWeight: checked
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+
+          Container(height: 1, color: Colors.white.withValues(alpha: 0.06)),
+          const SizedBox(height: 14),
+
+          // ── Footer: count + Generate button ───────────────────────────────
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 6),
+            child: Row(
+              children: [
+                // Selected count badge
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: _selected.isEmpty
+                        ? _surface2
+                        : _accent.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    _selected.isEmpty
+                        ? 'None selected'
+                        : '${_selected.length} selected',
+                    style: TextStyle(
+                      color: _selected.isEmpty ? _textMut : _accentLt,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                const Spacer(),
+                // Generate button
+                AnimatedOpacity(
+                  duration: const Duration(milliseconds: 200),
+                  opacity: _selected.isEmpty ? 0.4 : 1.0,
+                  child: GestureDetector(
+                    onTap: _selected.isEmpty
+                        ? null
+                        : () => widget.onGenerate(_selected.toList()),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 20,
+                        vertical: 11,
+                      ),
+                      decoration: BoxDecoration(
+                        gradient: const LinearGradient(
+                          colors: [_accent, Color(0xFF7C3AED)],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        borderRadius: BorderRadius.circular(14),
+                        boxShadow: _selected.isEmpty
+                            ? []
+                            : [
+                                BoxShadow(
+                                  color: _accent.withValues(alpha: 0.35),
+                                  blurRadius: 12,
+                                  offset: const Offset(0, 4),
+                                ),
+                              ],
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.auto_awesome_rounded,
+                            color: Colors.white,
+                            size: 15,
+                          ),
+                          SizedBox(width: 7),
+                          Text(
+                            'Generate',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+}
+
+// =============================================================================
+// Loading Dialog
+// =============================================================================
+
+class _LoadingDialog extends StatelessWidget {
+  const _LoadingDialog();
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: _surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: Padding(
+        padding: const EdgeInsets.all(28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                color: _accent.withValues(alpha: 0.12),
+                shape: BoxShape.circle,
+              ),
+              child: const Padding(
+                padding: EdgeInsets.all(14),
+                child: CircularProgressIndicator(
+                  color: _accentLt,
+                  strokeWidth: 2.5,
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            const Text(
+              'Generating summary…',
+              style: TextStyle(
+                color: _textPrim,
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              'Combining selected recordings with AI',
+              style: TextStyle(color: _textMut, fontSize: 12),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// =============================================================================
+// Summary Result Dialog
+// =============================================================================
+
+class _SummaryResultDialog extends StatelessWidget {
+  final String title;
+  final String summaryText;
+  final VoidCallback onCopy;
+
+  const _SummaryResultDialog({
+    required this.title,
+    required this.summaryText,
+    required this.onCopy,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: _surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // ── Header ──────────────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 20, 12, 0),
+            child: Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF34D399).withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.auto_awesome_rounded,
+                        size: 12,
+                        color: Color(0xFF34D399),
+                      ),
+                      SizedBox(width: 5),
+                      Text(
+                        'Combined Summary',
+                        style: TextStyle(
+                          color: Color(0xFF34D399),
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Spacer(),
+                // Copy button
+                Tooltip(
+                  message: 'Copy summary',
+                  child: InkWell(
+                    onTap: onCopy,
+                    borderRadius: BorderRadius.circular(8),
+                    child: const Padding(
+                      padding: EdgeInsets.all(8),
+                      child: Icon(
+                        Icons.copy_rounded,
+                        size: 18,
+                        color: _textMut,
+                      ),
+                    ),
+                  ),
+                ),
+                // Close button
+                InkWell(
+                  onTap: () => Navigator.pop(context),
+                  borderRadius: BorderRadius.circular(8),
+                  child: const Padding(
+                    padding: EdgeInsets.all(8),
+                    child: Icon(Icons.close_rounded, size: 18, color: _textMut),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // ── Title ────────────────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                title,
+                style: const TextStyle(
+                  color: _textPrim,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w700,
+                  height: 1.3,
+                ),
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 12),
+          Container(
+            height: 1,
+            margin: const EdgeInsets.symmetric(horizontal: 20),
+            color: Colors.white.withValues(alpha: 0.07),
+          ),
+          const SizedBox(height: 4),
+
+          // ── Scrollable body ───────────────────────────────────────────────
+          ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(context).size.height * 0.45,
+            ),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+              child: _buildFormattedText(summaryText),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFormattedText(String content) {
+    final lines = content.split('\n');
+    final List<Widget> widgets = [];
+
+    for (final rawLine in lines) {
+      final line = rawLine.trim();
+      if (line.isEmpty) {
+        if (widgets.isNotEmpty) widgets.add(const SizedBox(height: 8));
+        continue;
+      }
+
+      if (line.startsWith('### ')) {
+        widgets.add(
+          Padding(
+            padding: const EdgeInsets.only(top: 8, bottom: 4),
+            child: Text(
+              line.substring(4).replaceAll(RegExp(r'[#*`_]'), '').trim(),
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        );
+      } else if (line.startsWith('## ')) {
+        widgets.add(
+          Padding(
+            padding: const EdgeInsets.only(top: 12, bottom: 6),
+            child: Text(
+              line.substring(3).replaceAll(RegExp(r'[#*`_]'), '').trim(),
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        );
+      } else if (line.startsWith('# ')) {
+        widgets.add(
+          Padding(
+            padding: const EdgeInsets.only(top: 14, bottom: 8),
+            child: Text(
+              line.substring(2).replaceAll(RegExp(r'[#*`_]'), '').trim(),
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        );
+      } else if (line.startsWith('- ') || line.startsWith('* ')) {
+        widgets.add(
+          Padding(
+            padding: const EdgeInsets.only(left: 8, bottom: 4),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '• ',
+                  style: TextStyle(color: _accentLt, fontSize: 13),
+                ),
+                Expanded(
+                  child: Text(
+                    line.substring(2).trim(),
+                    style: const TextStyle(
+                      color: Color(0xFFD1D5DB),
+                      fontSize: 13,
+                      height: 1.4,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      } else {
+        widgets.add(
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Text(
+              line.replaceAll('**', ''),
+              style: const TextStyle(
+                color: Color(0xFFD1D5DB),
+                fontSize: 13,
+                height: 1.5,
+              ),
+            ),
+          ),
+        );
+      }
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: widgets,
+    );
   }
 }
 
@@ -283,7 +1030,8 @@ class _RecorderScreenState extends State<RecorderScreen>
 
 class _TopBar extends StatelessWidget {
   final VoidCallback? onImport;
-  const _TopBar({required this.onImport});
+  final VoidCallback? onLogout;
+  const _TopBar({required this.onImport, required this.onLogout});
 
   @override
   Widget build(BuildContext context) {
@@ -291,7 +1039,6 @@ class _TopBar extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
       child: Row(
         children: [
-          // Icon badge
           Container(
             width: 38,
             height: 38,
@@ -310,7 +1057,7 @@ class _TopBar extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'Audio Journal',
+                'AI voice notes',
                 style: TextStyle(
                   color: _textPrim,
                   fontSize: 17,
@@ -325,7 +1072,6 @@ class _TopBar extends StatelessWidget {
             ],
           ),
           const Spacer(),
-          // Import button
           Tooltip(
             message: 'Import audio file',
             child: InkWell(
@@ -342,6 +1088,28 @@ class _TopBar extends StatelessWidget {
                 child: Icon(
                   Icons.folder_open_rounded,
                   color: onImport == null ? _textMut : _textSec,
+                  size: 20,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Tooltip(
+            message: 'Log Out',
+            child: InkWell(
+              onTap: onLogout,
+              borderRadius: BorderRadius.circular(12),
+              child: Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: _surface,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white10),
+                ),
+                child: Icon(
+                  Icons.logout_rounded,
+                  color: onLogout == null ? _textMut : _danger.withOpacity(0.8),
                   size: 20,
                 ),
               ),
@@ -405,7 +1173,6 @@ class _RecorderSection extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Timer
           Text(
             formatTimer(currentDuration),
             style: TextStyle(
@@ -416,23 +1183,20 @@ class _RecorderSection extends StatelessWidget {
               letterSpacing: 3,
             ),
           ),
-
-          // Waveform (fixed height to avoid overflow)
           SizedBox(
             height: 80,
             child: VoiceWaveformWidget(isRecording: isRecording),
           ),
-
           const SizedBox(height: 12),
-
-          // Status label + Record button row
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              // Status pill
               AnimatedContainer(
                 duration: const Duration(milliseconds: 300),
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 6,
+                ),
                 decoration: BoxDecoration(
                   color: isRecording
                       ? _danger.withValues(alpha: 0.12)
@@ -475,10 +1239,7 @@ class _RecorderSection extends StatelessWidget {
                   ],
                 ),
               ),
-
               const SizedBox(width: 20),
-
-              // Record button
               ScaleTransition(
                 scale: pulseAnimation,
                 child: GestureDetector(
@@ -486,7 +1247,6 @@ class _RecorderSection extends StatelessWidget {
                   child: Stack(
                     alignment: Alignment.center,
                     children: [
-                      // Glow ring
                       AnimatedContainer(
                         duration: const Duration(milliseconds: 300),
                         width: 76,
@@ -498,7 +1258,6 @@ class _RecorderSection extends StatelessWidget {
                               : _accent.withValues(alpha: 0.1),
                         ),
                       ),
-                      // Main button
                       AnimatedContainer(
                         duration: const Duration(milliseconds: 300),
                         width: 60,
@@ -560,6 +1319,7 @@ class _RecordingsList extends StatelessWidget {
   final void Function(Recording, String) onRename;
   final String Function(Duration) formatDuration;
   final String Function(DateTime) formatDate;
+  final VoidCallback onCombine;
 
   const _RecordingsList({
     required this.recordings,
@@ -577,6 +1337,7 @@ class _RecordingsList extends StatelessWidget {
     required this.onRename,
     required this.formatDuration,
     required this.formatDate,
+    required this.onCombine,
   });
 
   @override
@@ -584,9 +1345,9 @@ class _RecordingsList extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // Section header
+        // ── Section header ─────────────────────────────────────────────────
         Padding(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 10),
+          padding: const EdgeInsets.fromLTRB(20, 16, 16, 10),
           child: Row(
             children: [
               const Text(
@@ -614,11 +1375,56 @@ class _RecordingsList extends StatelessWidget {
                   ),
                 ),
               ),
+              const Spacer(),
+              // ── Combine & Summarize button ─────────────────────────────
+              Tooltip(
+                message: 'Combine & Summarize',
+                child: InkWell(
+                  onTap: onCombine,
+                  borderRadius: BorderRadius.circular(12),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 11,
+                      vertical: 7,
+                    ),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFF312E81), Color(0xFF4C1D95)],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: _accentLt.withValues(alpha: 0.3),
+                      ),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.auto_awesome_rounded,
+                          size: 13,
+                          color: _accentLt,
+                        ),
+                        SizedBox(width: 5),
+                        Text(
+                          'Combine',
+                          style: TextStyle(
+                            color: _accentLt,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
             ],
           ),
         ),
 
-        // List
+        // ── List ──────────────────────────────────────────────────────────
         Expanded(
           child: recordings.isEmpty
               ? const _EmptyState()
@@ -675,12 +1481,20 @@ class _EmptyState extends StatelessWidget {
               shape: BoxShape.circle,
               border: Border.all(color: Colors.white10),
             ),
-            child: const Icon(Icons.graphic_eq_rounded, color: _textMut, size: 32),
+            child: const Icon(
+              Icons.graphic_eq_rounded,
+              color: _textMut,
+              size: 32,
+            ),
           ),
           const SizedBox(height: 16),
           const Text(
             'No recordings yet',
-            style: TextStyle(color: _textSec, fontSize: 15, fontWeight: FontWeight.w500),
+            style: TextStyle(
+              color: _textSec,
+              fontSize: 15,
+              fontWeight: FontWeight.w500,
+            ),
           ),
           const SizedBox(height: 6),
           const Text(
@@ -697,18 +1511,10 @@ class _EmptyState extends StatelessWidget {
 // Recording Card
 // =============================================================================
 
-/// Returns a human-readable title from a recording.
-/// Priority: summary first line > cleaned-up name.
-/// Returns a clean, human-readable title for a recording card.
-/// Priority: AI title > parsed filename date.
 String _displayTitle(Recording recording) {
-  // 1. Use AI-generated title if available (clean, no markdown)
   final aiTitle = recording.title;
-  if (aiTitle != null && aiTitle.isNotEmpty) {
-    return aiTitle;
-  }
+  if (aiTitle != null && aiTitle.isNotEmpty) return aiTitle;
 
-  // 2. Parse the REC_ filename for a pretty date fallback
   final name = recording.name;
   if (name.startsWith('REC_')) {
     final parts = name.split('_');
@@ -716,24 +1522,20 @@ String _displayTitle(Recording recording) {
       try {
         final dateStr = parts[1];
         final timeStr = parts[2];
-        final year  = int.parse(dateStr.substring(0, 4));
+        final year = int.parse(dateStr.substring(0, 4));
         final month = int.parse(dateStr.substring(4, 6));
-        final day   = int.parse(dateStr.substring(6, 8));
-        final hour  = int.parse(timeStr.substring(0, 2));
-        final min   = int.parse(timeStr.substring(2, 4));
-        return DateFormat("MMM d '·' h:mm a").format(
-          DateTime(year, month, day, hour, min),
-        );
+        final day = int.parse(dateStr.substring(6, 8));
+        final hour = int.parse(timeStr.substring(0, 2));
+        final min = int.parse(timeStr.substring(2, 4));
+        return DateFormat(
+          "MMM d '·' h:mm a",
+        ).format(DateTime(year, month, day, hour, min));
       } catch (_) {}
     }
     return 'Recording';
   }
 
-  // 3. Renamed file — clean up underscores
-  return name
-      .replaceAll(RegExp(r'\.[^.]+$'), '')
-      .replaceAll('_', ' ')
-      .trim();
+  return name.replaceAll(RegExp(r'\.[^.]+$'), '').replaceAll('_', ' ').trim();
 }
 
 class _RecordingCard extends StatelessWidget {
@@ -827,22 +1629,17 @@ class _RecordingCard extends StatelessWidget {
       ),
       child: Column(
         children: [
-          // ── Main row ───────────────────────────────────────────────────────
           Padding(
             padding: const EdgeInsets.fromLTRB(14, 12, 8, 12),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                // Play/Pause button
                 _PlayButton(
                   isItemPlaying: isItemPlaying,
                   isPlaying: isPlaying,
                   onTap: onPlayPause,
                 ),
-
                 const SizedBox(width: 14),
-
-                // Title + meta
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -861,13 +1658,11 @@ class _RecordingCard extends StatelessWidget {
                       const SizedBox(height: 5),
                       Row(
                         children: [
-                          // Duration badge
                           _MetaBadge(
                             icon: Icons.timer_outlined,
                             label: formatDuration(recording.duration),
                           ),
                           const SizedBox(width: 8),
-                          // Transcript status indicator
                           if (hasPendingTranscript)
                             _MetaBadge(
                               icon: Icons.auto_awesome_rounded,
@@ -885,16 +1680,11 @@ class _RecordingCard extends StatelessWidget {
                       const SizedBox(height: 3),
                       Text(
                         formatDate(recording.date),
-                        style: const TextStyle(
-                          color: _textMut,
-                          fontSize: 11,
-                        ),
+                        style: const TextStyle(color: _textMut, fontSize: 11),
                       ),
                     ],
                   ),
                 ),
-
-                // Action buttons column
                 Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -928,8 +1718,6 @@ class _RecordingCard extends StatelessWidget {
               ],
             ),
           ),
-
-          // ── Playback slider ────────────────────────────────────────────────
           if (isItemPlaying) ...[
             const _CardDivider(),
             _PlaybackSlider(
@@ -939,8 +1727,6 @@ class _RecordingCard extends StatelessWidget {
               formatDuration: formatDuration,
             ),
           ],
-
-          // ── Transcript panel ───────────────────────────────────────────────
           if (recording.isExpanded) ...[
             if (!isItemPlaying) const _CardDivider(),
             _TranscriptPanel(
@@ -1126,7 +1912,9 @@ class _PlaybackSlider extends StatelessWidget {
             child: SliderTheme(
               data: SliderTheme.of(context).copyWith(
                 trackHeight: 2.5,
-                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5.5),
+                thumbShape: const RoundSliderThumbShape(
+                  enabledThumbRadius: 5.5,
+                ),
                 overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
                 activeTrackColor: _accentLt,
                 inactiveTrackColor: _surface2,
@@ -1194,8 +1982,8 @@ class _TranscriptPanel extends StatelessWidget {
         final text = (recording.summary?.isNotEmpty == true)
             ? recording.summary!
             : (recording.transcript?.isNotEmpty == true)
-                ? recording.transcript!
-                : '';
+            ? recording.transcript!
+            : '';
         if (text.isEmpty) {
           return const Text(
             'No speech detected.',
@@ -1209,11 +1997,13 @@ class _TranscriptPanel extends StatelessWidget {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Header row
             Row(
               children: [
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 4,
+                  ),
                   decoration: BoxDecoration(
                     color: const Color(0xFF34D399).withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(20),
@@ -1221,8 +2011,11 @@ class _TranscriptPanel extends StatelessWidget {
                   child: const Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.auto_awesome_rounded,
-                          size: 12, color: Color(0xFF34D399)),
+                      Icon(
+                        Icons.auto_awesome_rounded,
+                        size: 12,
+                        color: Color(0xFF34D399),
+                      ),
                       SizedBox(width: 5),
                       Text(
                         'AI Summary',
@@ -1241,9 +2034,13 @@ class _TranscriptPanel extends StatelessWidget {
                   child: InkWell(
                     onTap: () => onCopy(text),
                     borderRadius: BorderRadius.circular(8),
-                    child: Padding(
-                      padding: const EdgeInsets.all(4),
-                      child: Icon(Icons.copy_rounded, size: 16, color: _textMut),
+                    child: const Padding(
+                      padding: EdgeInsets.all(4),
+                      child: Icon(
+                        Icons.copy_rounded,
+                        size: 16,
+                        color: _textMut,
+                      ),
                     ),
                   ),
                 ),
@@ -1313,19 +2110,16 @@ class _TranscriptPanel extends StatelessWidget {
     for (int i = 0; i < lines.length; i++) {
       final line = lines[i].trim();
       if (line.isEmpty) {
-        if (widgets.isNotEmpty) {
-          widgets.add(const SizedBox(height: 8));
-        }
+        if (widgets.isNotEmpty) widgets.add(const SizedBox(height: 8));
         continue;
       }
 
       if (line.startsWith('### ')) {
-        final heading = line.substring(4).replaceAll(RegExp(r'[#*`_]'), '').trim();
         widgets.add(
           Padding(
             padding: const EdgeInsets.only(top: 8, bottom: 4),
             child: Text(
-              heading,
+              line.substring(4).replaceAll(RegExp(r'[#*`_]'), '').trim(),
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 13,
@@ -1335,12 +2129,11 @@ class _TranscriptPanel extends StatelessWidget {
           ),
         );
       } else if (line.startsWith('## ')) {
-        final heading = line.substring(3).replaceAll(RegExp(r'[#*`_]'), '').trim();
         widgets.add(
           Padding(
             padding: const EdgeInsets.only(top: 12, bottom: 6),
             child: Text(
-              heading,
+              line.substring(3).replaceAll(RegExp(r'[#*`_]'), '').trim(),
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 14,
@@ -1350,12 +2143,11 @@ class _TranscriptPanel extends StatelessWidget {
           ),
         );
       } else if (line.startsWith('# ')) {
-        final heading = line.substring(2).replaceAll(RegExp(r'[#*`_]'), '').trim();
         widgets.add(
           Padding(
             padding: const EdgeInsets.only(top: 14, bottom: 8),
             child: Text(
-              heading,
+              line.substring(2).replaceAll(RegExp(r'[#*`_]'), '').trim(),
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 16,
@@ -1365,17 +2157,19 @@ class _TranscriptPanel extends StatelessWidget {
           ),
         );
       } else if (line.startsWith('- ') || line.startsWith('* ')) {
-        final item = line.substring(2).trim();
         widgets.add(
           Padding(
             padding: const EdgeInsets.only(left: 8, bottom: 4),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('• ', style: TextStyle(color: _accentLt, fontSize: 13)),
+                const Text(
+                  '• ',
+                  style: TextStyle(color: _accentLt, fontSize: 13),
+                ),
                 Expanded(
                   child: Text(
-                    item,
+                    line.substring(2).trim(),
                     style: const TextStyle(
                       color: Color(0xFFD1D5DB),
                       fontSize: 13,
@@ -1388,13 +2182,11 @@ class _TranscriptPanel extends StatelessWidget {
           ),
         );
       } else {
-        // Plain text or inline bolds (just clean up markdown bold chars)
-        final cleanLine = line.replaceAll('**', '');
         widgets.add(
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
             child: Text(
-              cleanLine,
+              line.replaceAll('**', ''),
               style: const TextStyle(
                 color: Color(0xFFD1D5DB),
                 fontSize: 13,
@@ -1461,13 +2253,13 @@ class _PendingTranscript extends StatelessWidget {
   }
 
   Widget _line(double w) => Container(
-        width: w,
-        height: 10,
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(6),
-        ),
-      );
+    width: w,
+    height: 10,
+    decoration: BoxDecoration(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(6),
+    ),
+  );
 }
 
 // =============================================================================
@@ -1515,7 +2307,9 @@ class _RenameDialog extends StatelessWidget {
                 filled: true,
                 fillColor: _surface2,
                 contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16, vertical: 12),
+                  horizontal: 16,
+                  vertical: 12,
+                ),
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
                   borderSide: BorderSide.none,
@@ -1536,7 +2330,8 @@ class _RenameDialog extends StatelessWidget {
                       foregroundColor: _textSec,
                       side: const BorderSide(color: Colors.white24),
                       shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
                       padding: const EdgeInsets.symmetric(vertical: 12),
                     ),
                     child: const Text('Cancel'),
@@ -1550,7 +2345,8 @@ class _RenameDialog extends StatelessWidget {
                       backgroundColor: _accent,
                       foregroundColor: Colors.white,
                       shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
                       padding: const EdgeInsets.symmetric(vertical: 12),
                     ),
                     child: const Text('Save'),
@@ -1590,8 +2386,11 @@ class _DeleteDialog extends StatelessWidget {
                 color: _danger.withValues(alpha: 0.12),
                 shape: BoxShape.circle,
               ),
-              child: const Icon(Icons.delete_outline_rounded,
-                  color: _danger, size: 28),
+              child: const Icon(
+                Icons.delete_outline_rounded,
+                color: _danger,
+                size: 28,
+              ),
             ),
             const SizedBox(height: 16),
             const Text(
@@ -1618,7 +2417,8 @@ class _DeleteDialog extends StatelessWidget {
                       foregroundColor: _textSec,
                       side: const BorderSide(color: Colors.white24),
                       shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
                       padding: const EdgeInsets.symmetric(vertical: 12),
                     ),
                     child: const Text('Cancel'),
@@ -1632,7 +2432,8 @@ class _DeleteDialog extends StatelessWidget {
                       backgroundColor: _danger,
                       foregroundColor: Colors.white,
                       shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
                       padding: const EdgeInsets.symmetric(vertical: 12),
                     ),
                     child: const Text('Delete'),
