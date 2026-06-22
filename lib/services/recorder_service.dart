@@ -294,7 +294,7 @@ class RecorderService extends ChangeNotifier {
       await sourceFile.copy(destPath);
 
       await loadRecordings();
-      _triggerTranscription(destPath);
+      _triggerTranscription(destPath, isImported: true);
       return true;
     } catch (e) {
       debugPrint('[RecorderService] importFile error: $e');
@@ -313,89 +313,43 @@ class RecorderService extends ChangeNotifier {
         ? '${inputPath.substring(0, dotIndex)}_clean${inputPath.substring(dotIndex)}'
         : '${inputPath}_clean';
 
-    final probeArgs = [
-      '-i',
-      inputPath,
-      '-af',
-      'volumedetect',
-      '-f',
-      'null',
-      '-',
-    ];
-    await FFmpegKit.executeWithArgumentsAsync(probeArgs, (session) async {
-      final logs = await session.getAllLogsAsString();
-      debugPrint('[VolumeDetect] $logs');
-    });
-
     final arguments = [
       '-y',
       '-i',
       inputPath,
       '-af',
-      // 'silenceremove=start_periods=1:start_duration=0.3:start_threshold=-35dB:stop_periods=-1:stop_duration=0.5:stop_threshold=-35dB',
       'afftdn=nf=-25,silenceremove=start_periods=1:start_duration=0.3:start_threshold=-35dB:stop_periods=-1:stop_duration=0.5:stop_threshold=-35dB',
       outputPath,
     ];
 
-    debugPrint('[RecorderService] Starting silence removal for: $inputPath');
     try {
       await FFmpegKit.executeWithArgumentsAsync(arguments, (session) async {
         final returnCode = await session.getReturnCode();
         if (ReturnCode.isSuccess(returnCode)) {
-          // Calculate statistics
           final inputSize = File(inputPath).existsSync()
               ? File(inputPath).lengthSync()
               : 0;
           final outputSize = File(outputPath).existsSync()
               ? File(outputPath).lengthSync()
               : 0;
-
-          int inputDurationMs = 0;
-          int outputDurationMs = 0;
-          try {
-            final player = AudioPlayer();
-            final inputDur = await player.setFilePath(inputPath);
-            inputDurationMs = inputDur?.inMilliseconds ?? 0;
-            final outputDur = await player.setFilePath(outputPath);
-            outputDurationMs = outputDur?.inMilliseconds ?? 0;
-            await player.dispose();
-          } catch (e) {
-            debugPrint('[RecorderService] Error probing duration: $e');
-          }
-
-          debugPrint(
-            '[RecorderService] Silence removal completed successfully:',
-          );
-          debugPrint(
-            '  - Original File: $inputPath (${(inputSize / 1024).toStringAsFixed(1)} KB, ${(inputDurationMs / 1000).toStringAsFixed(2)}s)',
-          );
-          debugPrint(
-            '  - Cleaned File: $outputPath (${(outputSize / 1024).toStringAsFixed(1)} KB, ${(outputDurationMs / 1000).toStringAsFixed(2)}s)',
-          );
-          if (inputSize > 0 && inputDurationMs > 0) {
-            final sizeReduction = ((1 - outputSize / inputSize) * 100)
+          if (inputSize > 0) {
+            final reduction = ((1 - outputSize / inputSize) * 100)
                 .toStringAsFixed(1);
-            final durationReduction =
-                ((1 - outputDurationMs / inputDurationMs) * 100)
-                    .toStringAsFixed(1);
             debugPrint(
-              '  - Reduction: Size: $sizeReduction% | Duration: $durationReduction%',
+              '[RecorderService] Silence removed: ${(inputSize / 1024).toStringAsFixed(1)}KB → ${(outputSize / 1024).toStringAsFixed(1)}KB ($reduction% reduced)',
             );
           }
-
           completer.complete(outputPath);
         } else {
           final failCode = returnCode?.getValue();
           debugPrint(
             '[RecorderService] FFmpeg failed with return code: $failCode',
           );
-          // Fallback: return original inputPath so transcription still proceeds
           completer.complete(inputPath);
         }
       });
     } catch (e) {
       debugPrint('[RecorderService] FFmpeg execution exception: $e');
-      // Fallback: return original inputPath
       completer.complete(inputPath);
     }
 
@@ -406,13 +360,12 @@ class RecorderService extends ChangeNotifier {
   ///
   /// Updates the in-memory recording and persists sidecar at each stage:
   /// idle → pending → done | failed.
-  void _triggerTranscription(String audioPath) {
+  void _triggerTranscription(String audioPath, {bool isImported = false}) {
     _setTranscriptStatus(audioPath, TranscriptStatus.pending);
 
     final languageCode = _selectedLanguage.apiCode;
 
     removeSilence(audioPath).then((cleanAudioPath) async {
-      // ── Guard: skip transcription if cleaned file is too short ──
       final cleanFile = File(cleanAudioPath);
       if (!cleanFile.existsSync()) {
         debugPrint(
@@ -422,7 +375,6 @@ class RecorderService extends ChangeNotifier {
         return;
       }
 
-      // Probe cleaned file duration
       int cleanDurationMs = 0;
       try {
         final probe = AudioPlayer();
@@ -454,12 +406,10 @@ class RecorderService extends ChangeNotifier {
         return;
       }
 
-      debugPrint(
-        '[RecorderService] Sending audio to transcription service: $cleanAudioPath',
-      );
       TranscriptionService.transcribeFile(
             cleanAudioPath,
             languageCode: languageCode,
+            isImported: isImported,
           )
           .then((result) {
             final rec = _findByPath(audioPath);
@@ -476,7 +426,6 @@ class RecorderService extends ChangeNotifier {
             TranscriptionService.saveSidecar(audioPath, sidecar);
             _applyTranscriptSidecar(audioPath, sidecar);
 
-            // ── Auto-rename using AI title (preferred) or first 6 words of summary ──
             String? renameTarget;
             if (result.title.isNotEmpty) {
               renameTarget = result.title
@@ -514,9 +463,6 @@ class RecorderService extends ChangeNotifier {
                 final cleanFile = File(cleanAudioPath);
                 if (cleanFile.existsSync()) {
                   cleanFile.deleteSync();
-                  debugPrint(
-                    '[RecorderService] Deleted temporary clean file: $cleanAudioPath',
-                  );
                 }
               } catch (e) {
                 debugPrint(

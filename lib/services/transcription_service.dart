@@ -2,7 +2,10 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
+import 'package:dio/dio.dart' as dio;
 import '../constants.dart';
+import 'api_service.dart';
+import 'audio_chunker.dart';
 
 enum TranscriptStatus { idle, pending, done, failed }
 
@@ -80,7 +83,7 @@ class TranscriptionService {
   TranscriptionService._();
 
   static final _model = GenerativeModel(
-    model: 'gemini-2.5-flash-lite', // current free-tier model
+    model: 'gemini-3.1-flash-lite', // current free-tier model
     apiKey: kGeminiApiKey,
   );
 
@@ -130,11 +133,16 @@ class TranscriptionService {
   static Future<TranscriptionResult> transcribeFile(
     String audioPath, {
     String? languageCode,
+    bool isImported = false,
     int retries = 3,
   }) async {
     for (int attempt = 0; attempt < retries; attempt++) {
       try {
-        return await _doTranscribe(audioPath, languageCode: languageCode);
+        return await _doTranscribe(
+          audioPath,
+          languageCode: languageCode,
+          isImported: isImported,
+        );
       } catch (e) {
         if (attempt == retries - 1) rethrow;
         final waitSeconds = 40 * (attempt + 1);
@@ -150,124 +158,310 @@ class TranscriptionService {
   static Future<TranscriptionResult> _doTranscribe(
     String audioPath, {
     String? languageCode,
+    bool isImported = false,
   }) async {
     final file = File(audioPath);
     if (!await file.exists()) {
       throw Exception('Audio file not found: $audioPath');
     }
 
-    final sizeInMB = file.lengthSync() / (1024 * 1024);
+    final totalSizeInMB = file.lengthSync() / (1024 * 1024);
     debugPrint(
-      '[TranscriptionService] File size: ${sizeInMB.toStringAsFixed(1)}MB',
+      '[TranscriptionService] Total file size: ${totalSizeInMB.toStringAsFixed(1)}MB',
     );
-    debugPrint('[TranscriptionService] Sending to Gemini...');
 
-    final audioBytes = await file.readAsBytes();
-    final ext = audioPath.split('.').last.toLowerCase();
-    final mimeType = _mimeType(ext);
+    // ── Imported file: transcription only, single save + summary in one call ─
+    if (isImported) {
+      debugPrint(
+        '[TranscriptionService] Imported file — sending whole audio to Gemini...',
+      );
+      final audioBytes = await file.readAsBytes();
+      final ext = audioPath.split('.').last.toLowerCase();
+      final mimeType = _mimeType(ext);
 
-    final languageInstruction = languageCode != null
-        ? 'The audio is in language code "$languageCode". Transcribe in that language.'
-        : 'Auto-detect the language and transcribe in the original language.';
+      const prompt =
+          'You are an audio transcription assistant. Transcribe the following audio file and return only the plain transcribed text with no JSON, no timestamps, and no speaker labels.';
 
-    // final prompt = '''
-    // Transcribe the full audio word by word. Be accurate.
-    // Identify each distinct speaker as "Speaker 1", "Speaker 2", etc.
-    // Format each line as [Speaker N]: <spoken text>
-    // Be consistent with speaker labels throughout.
-    // Return ONLY the transcript, nothing else. No JSON, no summary, just speaker-labeled lines.
-    // $languageInstruction
-    // ''';
+      final response = await _model.generateContent([
+        Content.multi([DataPart(mimeType, audioBytes), TextPart(prompt)]),
+      ]);
 
-    final prompt =
-        '''
-You are an intelligent audio analyst. Listen to the entire audio carefully.
+      final transcriptText = (response.text ?? '').trim();
+      debugPrint(
+        '[TranscriptionService] Imported file transcript: $transcriptText',
+      );
 
-Return your response in EXACTLY this format (no extra text before or after):
+      final finalTranscript = transcriptText.isEmpty
+          ? '[No transcription generated]'
+          : transcriptText;
+      final filename = audioPath.split('/').last;
 
-TITLE: <a concise title, maximum 5 words, no punctuation, no markdown>
+      // Single chunk + final chunk at once: save and generate summary in the same call.
+      debugPrint(
+        '[TranscriptionService] [Imported] Saving transcript + requesting summary...',
+      );
+      try {
+        final formData = dio.FormData.fromMap({
+          'transcript_text': finalTranscript,
+          'audio_filename': filename,
+        });
+        final saveResp = await ApiService().post(
+          '/transcribe/simple',
+          queryParameters: {'generate_summary': true},
+          data: formData,
+        );
+        debugPrint(
+          '[TranscriptionService] [Imported] DB Save status: ${saveResp.statusCode}',
+        );
 
----SUMMARY---
+        if (saveResp.statusCode != 200 && saveResp.statusCode != 201) {
+          return TranscriptionResult(
+            transcript: finalTranscript,
+            summary:
+                'Failed to save transcription (Status: ${saveResp.statusCode}). Summary generation aborted.',
+            title: 'Recording',
+            language: languageCode ?? '',
+          );
+        }
 
-## Overview
-Write 2-3 concise sentences describing the overall purpose and context of the recording.
+        final body = saveResp.data;
+        debugPrint('[TranscriptionService] [Imported] Response body: $body');
+        String summaryText = '';
+        String title = 'Recording';
+        if (body is Map<String, dynamic>) {
+          // Backend nests summary as: { summary: { title: "...", summary: "..." } }
+          final summaryField = body['summary'];
+          if (summaryField is Map<String, dynamic>) {
+            summaryText = _asString(summaryField['summary']) ?? '';
+            final parsedTitle = _asString(summaryField['title']);
+            if (parsedTitle != null && parsedTitle.isNotEmpty) {
+              title = parsedTitle;
+            }
+          } else {
+            summaryText = _asString(summaryField) ?? '';
+          }
+        }
 
-## Key Topics
-- Topic: Brief explanation
-
-(List every major topic. Do not invent topics.)
-
-## Decisions Made
-- Decision
-
-(OMIT this entire section, including the heading, if no decisions were made.)
-
-## Action Items
-- Task — Owner — Deadline
-
-(OMIT this entire section, including the heading, if no tasks were assigned. Never invent owner or deadline.)
-
-## Important Notes
-- Key facts, numbers, names, risks mentioned.
-
-(OMIT this entire section, including the heading, if no such information exists.)
-
-## Follow-ups
-- Open questions or unresolved items.
-
-(OMIT this entire section, including the heading, if nothing remains unresolved.)
-
-Rules:
-- Focus on WHAT was discussed, not WHO said it.
-- Do not fabricate any information.
-- Do not write "None", "N/A", or empty bullet points under any section.
-- Remove filler, greetings, repetitions.
-- Preserve exact numbers, names, and technical terms.
-- For personal notes or journals, summarize naturally without forcing meeting-style sections.
-
-$languageInstruction
-''';
-
-    final response = await _model.generateContent([
-      Content.multi([DataPart(mimeType, audioBytes), TextPart(prompt)]),
-    ]);
-
-    final raw = response.text ?? '';
-    debugPrint('[TranscriptionService] Gemini raw response: $raw');
-
-    return _parseResponse(raw);
-  }
-
-  // ─── Parse Gemini response ────────────────────────────────────────────────
-
-  static TranscriptionResult _parseResponse(String raw) {
-    String title = '';
-    String summary = raw.trim();
-
-    // Extract TITLE line
-    final titleMatch = RegExp(
-      r'^TITLE:\s*(.+)$',
-      multiLine: true,
-      caseSensitive: false,
-    ).firstMatch(raw);
-    if (titleMatch != null) {
-      title = titleMatch.group(1)?.trim() ?? '';
-      // Remove markdown noise from title just in case
-      title = title.replaceAll(RegExp(r'[#*`_]'), '').trim();
+        return TranscriptionResult(
+          transcript: finalTranscript,
+          summary: summaryText,
+          title: title,
+          language: languageCode ?? '',
+        );
+      } catch (e) {
+        debugPrint('[TranscriptionService] [Imported] DB Save error: $e');
+        return TranscriptionResult(
+          transcript: finalTranscript,
+          summary:
+              'Error saving transcription: $e. Summary generation aborted.',
+          title: 'Recording',
+          language: languageCode ?? '',
+        );
+      }
     }
 
-    // Strip the TITLE line and the separator from the summary
-    summary = raw
-        .replaceAll(RegExp(r'^TITLE:.*$', multiLine: true), '')
-        .replaceAll('---SUMMARY---', '')
-        .trim();
+    // ── Recorded file: chunk → transcribe → save (summary on last chunk) ─────
+    // Chunk the audio if necessary
+    final chunkPaths = await AudioChunker.split(audioPath);
+    final wasChunked = chunkPaths.length > 1;
 
-    return TranscriptionResult(
-      transcript: '',
-      summary: summary,
-      title: title,
-      language: '',
-    );
+    final List<String> allTranscripts = [];
+    String? transcriptId;
+    String summaryText = '';
+    String title = 'Recording';
+
+    try {
+      for (int i = 0; i < chunkPaths.length; i++) {
+        final chunkPath = chunkPaths[i];
+        final chunkFile = File(chunkPath);
+        final isLastChunk = i == chunkPaths.length - 1;
+        debugPrint(
+          '[TranscriptionService] Processing chunk ${i + 1}/${chunkPaths.length}...',
+        );
+
+        final audioBytes = await chunkFile.readAsBytes();
+        final ext = chunkPath.split('.').last.toLowerCase();
+        final mimeType = _mimeType(ext);
+
+        final prompt =
+            '''You are an audio transcription assistant. Transcribe the following audio file.
+Return the transcription as a JSON object matching exactly this schema:
+{
+  "segments": [
+    {"start": 0.0, "end": 2.5, "text": "actual transcribed text here"}
+  ]
+}
+
+Note: Since this is a transcription task, please provide the actual transcribed text
+and reasonable timestamps for each segment in total seconds. Do NOT include speaker information.
+CRITICAL: The "start" and "end" timestamps MUST be valid floating point values in total seconds
+(e.g., 60.5 for 1 minute and 0.5 seconds). DO NOT use formatted strings or multiple decimals like 1.0.66.''';
+
+        // 1. Generate Transcription with Gemini
+        final response = await _model.generateContent([
+          Content.multi([DataPart(mimeType, audioBytes), TextPart(prompt)]),
+        ]);
+
+        final rawGemini = response.text ?? '';
+        debugPrint(
+          '[TranscriptionService] Gemini chunk ${i + 1} raw response: $rawGemini',
+        );
+
+        String transcriptText = '';
+        try {
+          String jsonStr = rawGemini;
+          if (jsonStr.contains('```json')) {
+            jsonStr = jsonStr.split('```json')[1].split('```')[0].trim();
+          } else if (jsonStr.contains('```')) {
+            jsonStr = jsonStr.split('```')[1].trim();
+          } else {
+            // Attempt to find the outermost JSON object or array
+            final firstBracket = jsonStr.indexOf(RegExp(r'[\{\[]'));
+            final lastBracket = jsonStr.lastIndexOf(RegExp(r'[\}\]]'));
+            if (firstBracket != -1 &&
+                lastBracket != -1 &&
+                lastBracket > firstBracket) {
+              jsonStr = jsonStr.substring(firstBracket, lastBracket + 1);
+            }
+          }
+
+          final jsonObj = jsonDecode(jsonStr);
+
+          if (jsonObj is Map<String, dynamic>) {
+            if (jsonObj.containsKey('segments')) {
+              final segments = jsonObj['segments'] as List<dynamic>;
+              transcriptText = segments
+                  .map((s) => s['text']?.toString() ?? '')
+                  .join(' ');
+            } else if (jsonObj.containsKey('text')) {
+              transcriptText = jsonObj['text'] as String;
+            } else {
+              transcriptText = rawGemini;
+            }
+          } else if (jsonObj is List<dynamic>) {
+            // In case Gemini still returns a raw list of segments
+            transcriptText = jsonObj
+                .map((s) => s['text']?.toString() ?? '')
+                .join(' ');
+          }
+        } catch (e) {
+          debugPrint(
+            '[TranscriptionService] Failed to parse Gemini JSON for chunk ${i + 1}: $e',
+          );
+          transcriptText = rawGemini;
+        }
+
+        transcriptText = transcriptText.trim();
+        if (transcriptText.isEmpty) {
+          debugPrint(
+            '[TranscriptionService] No transcription generated for chunk ${i + 1}.',
+          );
+          transcriptText = '[No transcription generated for chunk ${i + 1}]';
+        }
+
+        allTranscripts.add(transcriptText);
+
+        final filename = chunkPath.split('/').last;
+
+        // 2. Save transcript chunk to backend database.
+        //    - First chunk: no transcript_id yet, backend creates one and returns it.
+        //    - Middle chunks: pass transcript_id so backend appends.
+        //    - Last chunk: pass transcript_id + generate_summary=true to get the summary back.
+        debugPrint(
+          '[TranscriptionService] Saving transcript chunk ${i + 1} to DB...',
+        );
+        try {
+          final formData = dio.FormData.fromMap({
+            'transcript_text': transcriptText,
+            'audio_filename': filename,
+          });
+
+          final queryParameters = <String, dynamic>{
+            if (transcriptId != null) 'transcript_id': transcriptId,
+            if (isLastChunk) 'generate_summary': true,
+          };
+
+          final saveResp = await ApiService().post(
+            '/transcribe/simple',
+            queryParameters: queryParameters,
+            data: formData,
+          );
+          debugPrint(
+            '[TranscriptionService] DB Save chunk ${i + 1} status: ${saveResp.statusCode}',
+          );
+
+          if (saveResp.statusCode != 200 && saveResp.statusCode != 201) {
+            debugPrint(
+              '[TranscriptionService] Save API failed for chunk ${i + 1}. Skipping further steps.',
+            );
+            return TranscriptionResult(
+              transcript: allTranscripts.join('\n\n').trim(),
+              summary:
+                  'Failed to save transcription (Status: ${saveResp.statusCode}). Summary generation aborted.',
+              title: 'Recording',
+              language: languageCode ?? '',
+            );
+          }
+
+          final body = saveResp.data;
+          debugPrint(
+            '[TranscriptionService] Chunk ${i + 1} response body: $body',
+          );
+          if (body is Map<String, dynamic>) {
+            // Capture transcript_id from the first response so later chunks can append to it.
+            transcriptId ??= _asString(body['transcript_id']) ?? transcriptId;
+
+            if (isLastChunk) {
+              // Backend nests summary as: { summary: { title: "...", summary: "..." } }
+              final summaryField = body['summary'];
+              if (summaryField is Map<String, dynamic>) {
+                summaryText = _asString(summaryField['summary']) ?? '';
+                final parsedTitle = _asString(summaryField['title']);
+                if (parsedTitle != null && parsedTitle.isNotEmpty) {
+                  title = parsedTitle;
+                }
+              } else {
+                summaryText = _asString(summaryField) ?? '';
+              }
+            }
+          }
+        } catch (e) {
+          debugPrint('[TranscriptionService] DB Save chunk ${i + 1} error: $e');
+          return TranscriptionResult(
+            transcript: allTranscripts.join('\n\n').trim(),
+            summary:
+                'Error saving transcription: $e. Summary generation aborted.',
+            title: 'Recording',
+            language: languageCode ?? '',
+          );
+        }
+      }
+
+      final fullTranscript = allTranscripts.join('\n\n').trim();
+
+      if (fullTranscript.isEmpty ||
+          allTranscripts.every((t) => t.startsWith('[No transcription'))) {
+        return TranscriptionResult(
+          transcript: fullTranscript,
+          summary: 'No valid transcription found. Summary generation skipped.',
+          title: 'Recording',
+          language: languageCode ?? '',
+        );
+      }
+
+      // Summary now arrives inline with the last chunk's /transcribe/simple response,
+      // so there's no separate /summary/preview call needed here anymore.
+      return TranscriptionResult(
+        transcript: fullTranscript,
+        summary: summaryText,
+        title: title,
+        language: languageCode ?? '',
+      );
+    } finally {
+      if (wasChunked) {
+        await AudioChunker.deleteChunks(chunkPaths, audioPath);
+      }
+    }
   }
 
   // ─── MIME type helper ─────────────────────────────────────────────────────
@@ -281,6 +475,38 @@ $languageInstruction
       'flac' => 'audio/flac',
       _ => 'audio/m4a', // default for m4a, aac, mp4 audio
     };
+  }
+
+  // ─── Response parsing helper ──────────────────────────────────────────────
+
+  /// Safely extracts a String from a JSON value that *should* be a string
+  /// but might come back as something else (null, a nested map, a list,
+  /// a number) depending on backend response shape. Never throws.
+  static String? _asString(dynamic value) {
+    if (value == null) return null;
+    if (value is String) return value;
+    if (value is Map<String, dynamic>) {
+      // Common nested shapes: {"text": "..."} or {"value": "..."}
+      final nested = value['text'] ?? value['value'] ?? value['content'];
+      if (nested is String) return nested;
+      debugPrint(
+        '[TranscriptionService] Unexpected map shape for string field: $value',
+      );
+      return null;
+    }
+    if (value is List) {
+      // e.g. a list of segments/strings — join whatever text we can find.
+      return value
+          .map(
+            (e) => e is String
+                ? e
+                : (e is Map ? (e['text']?.toString() ?? '') : e.toString()),
+          )
+          .where((s) => s.isNotEmpty)
+          .join(' ');
+    }
+    // Fallback: numbers, bools, etc.
+    return value.toString();
   }
 }
 
@@ -297,950 +523,3 @@ class TranscriptionResult {
     required this.language,
   });
 }
-
-
-// LLM
-// import 'dart:convert';
-// import 'dart:io';
-// import 'package:flutter/foundation.dart';
-// import 'package:flutter/services.dart';
-// import 'package:path_provider/path_provider.dart';
-// import 'package:whisper_flutter_new/whisper_flutter_new.dart';
-// import '../constants.dart';
-// import 'package:audio_decoder/audio_decoder.dart';
-
-// enum TranscriptStatus { idle, pending, done, failed }
-
-// class TranscriptionSidecar {
-//   final TranscriptStatus status;
-//   final String? transcript;
-//   final String? language;
-
-//   const TranscriptionSidecar({
-//     required this.status,
-//     this.transcript,
-//     this.language,
-//   });
-
-//   static const idle = TranscriptionSidecar(status: TranscriptStatus.idle);
-
-//   factory TranscriptionSidecar.fromJson(Map<String, dynamic> json) {
-//     final statusStr = json['status'] as String? ?? 'idle';
-//     final status = switch (statusStr) {
-//       'done' => TranscriptStatus.done,
-//       'pending' => TranscriptStatus.pending,
-//       'failed' => TranscriptStatus.failed,
-//       _ => TranscriptStatus.idle,
-//     };
-//     return TranscriptionSidecar(
-//       status: status,
-//       transcript: json['transcript'] as String?,
-//       language: json['language'] as String?,
-//     );
-//   }
-
-//   Map<String, dynamic> toJson() => {
-//     'status': switch (status) {
-//       TranscriptStatus.done => 'done',
-//       TranscriptStatus.pending => 'pending',
-//       TranscriptStatus.failed => 'failed',
-//       TranscriptStatus.idle => 'idle',
-//     },
-//     'transcript': transcript,
-//     'language': language,
-//   };
-// }
-
-// class TranscriptionService {
-//   TranscriptionService._();
-
-//   // static const String _modelAssetPath = 'assets/models/ggml-base.bin';
-//   static const String _modelAssetPath = 'assets/models/ggml-tiny.bin';
-
-//   static String? _modelDir; // cached after first copy
-
-//   // ─── Sidecar helpers ──────────────────────────────────────────────────────
-
-//   static String sidecarPath(String audioPath) {
-//     final dotIndex = audioPath.lastIndexOf('.');
-//     if (dotIndex == -1) return '$audioPath.json';
-//     return '${audioPath.substring(0, dotIndex)}.json';
-//   }
-
-//   static Future<TranscriptionSidecar> loadSidecar(String audioPath) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       if (!await file.exists()) return TranscriptionSidecar.idle;
-//       final content = await file.readAsString();
-//       final json = jsonDecode(content) as Map<String, dynamic>;
-//       return TranscriptionSidecar.fromJson(json);
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] loadSidecar error: $e');
-//       return TranscriptionSidecar.idle;
-//     }
-//   }
-
-//   static Future<void> saveSidecar(
-//     String audioPath,
-//     TranscriptionSidecar sidecar,
-//   ) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       await file.writeAsString(jsonEncode(sidecar.toJson()));
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] saveSidecar error: $e');
-//     }
-//   }
-
-//   static Future<void> deleteSidecar(String audioPath) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       if (await file.exists()) await file.delete();
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] deleteSidecar error: $e');
-//     }
-//   }
-
-//   // ─── Model setup ──────────────────────────────────────────────────────────
-
-//   /// Copies model from assets → library dir once, returns the dir path.
-//   static Future<String> _ensureModelReady() async {
-//     if (_modelDir != null) return _modelDir!;
-
-//     final Directory libDir = Platform.isAndroid
-//         ? await getApplicationSupportDirectory()
-//         : await getLibraryDirectory();
-
-//     // final modelFile = File('${libDir.path}/ggml-base.bin');
-//     final modelFile = File('${libDir.path}/ggml-tiny.bin');
-
-//     if (!await modelFile.exists()) {
-//       debugPrint('[TranscriptionService] Copying model from assets...');
-//       final byteData = await rootBundle.load(_modelAssetPath);
-//       await modelFile.writeAsBytes(byteData.buffer.asUint8List());
-//       debugPrint('[TranscriptionService] Model ready at ${modelFile.path}');
-//     } else {
-//       debugPrint('[TranscriptionService] Model already exists, skipping copy.');
-//     }
-
-//     _modelDir = libDir.path;
-//     return _modelDir!;
-//   }
-
-//   // ─── Main entry point ─────────────────────────────────────────────────────
-
-// static Future<String> transcribeFile(
-//   String audioPath, {
-//   String? languageCode,
-// }) async {
-//   final file = File(audioPath);
-//   if (!await file.exists()) {
-//     throw Exception('Audio file not found: $audioPath');
-//   }
-
-//   // Always re-encode to ensure correct 16kHz mono 16-bit PCM
-//   final wavPath = await _ensureWav(audioPath);
-
-//   final sizeInMB = File(wavPath).lengthSync() / (1024 * 1024);
-//   debugPrint('[TranscriptionService] File size: ${sizeInMB.toStringAsFixed(1)}MB');
-//   debugPrint('[TranscriptionService] Starting on-device transcription...');
-
-//   return _transcribeOnDevice(wavPath, languageCode: languageCode);
-// }
-
-
-
-// static Future<String> _ensureWav(String audioPath) async {
-//   final supportDir = await getApplicationSupportDirectory();
-//   final whisperInput = '${supportDir.path}/whisper_input.wav';
-
-//   final ext = audioPath.split('.').last.toLowerCase();
-
-//   if (ext == 'wav') {
-//     // Re-encode to ensure correct 16kHz mono 16-bit PCM format
-//     await AudioDecoder.convertToWav(
-//       audioPath,
-//       whisperInput,
-//       sampleRate: 16000,
-//       channels: 1,
-//     );
-//   } else {
-//     await AudioDecoder.convertToWav(
-//       audioPath,
-//       whisperInput,
-//       sampleRate: 16000,
-//       channels: 1,
-//     );
-//   }
-
-//   debugPrint('[TranscriptionService] WAV ready at: $whisperInput');
-//   return whisperInput;
-// }
-
-//   // ─── On-device Whisper ────────────────────────────────────────────────────
-
-// static Future<String> _transcribeOnDevice(
-//   String audioPath, {
-//   String? languageCode,
-// }) async {
-
-//     // Check file duration
-//   final fileSizeBytes = File(audioPath).lengthSync();
-//   // At 16kHz mono 16-bit: bytes / (16000 * 2) = seconds
-//   final estimatedSeconds = fileSizeBytes / (16000 * 2);
-//   debugPrint('[TranscriptionService] Estimated duration: ${estimatedSeconds.toStringAsFixed(1)}s');
-//   debugPrint('[TranscriptionService] Chunks needed: ${(estimatedSeconds / 30).ceil()}');
-
-
-
-//   final modelDir = await _ensureModelReady();
-
-//   final whisper = Whisper(
-//     model: WhisperModel.tiny,   // ← match your .bin file name
-//     modelDir: modelDir,         // ← it looks for ggml-tiny.bin here
-//   );
-
-//   final response = await whisper.transcribe(
-//     transcribeRequest: TranscribeRequest(
-//       audio: audioPath,
-//       isTranslate: false,
-//       language: languageCode ?? 'auto',
-//     ),
-//   );
-
-//   final text = response.text?.trim() ?? '';
-//   debugPrint('[TranscriptionService] Whisper done: $text');
-//   return text;
-// }
-
-// }
-
-// Groq
-
-// import 'dart:convert';
-// import 'dart:io';
-// import 'package:flutter/foundation.dart';
-// import 'package:http/http.dart' as http;
-// import 'package:path_provider/path_provider.dart';
-// import '../constants.dart';
-
-// enum TranscriptStatus { idle, pending, done, failed }
-
-// class TranscriptionSidecar {
-//   final TranscriptStatus status;
-//   final String? transcript;
-//   final String? language;
-
-//   const TranscriptionSidecar({
-//     required this.status,
-//     this.transcript,
-//     this.language,
-//   });
-
-//   static const idle = TranscriptionSidecar(status: TranscriptStatus.idle);
-
-//   factory TranscriptionSidecar.fromJson(Map<String, dynamic> json) {
-//     final statusStr = json['status'] as String? ?? 'idle';
-//     final status = switch (statusStr) {
-//       'done' => TranscriptStatus.done,
-//       'pending' => TranscriptStatus.pending,
-//       'failed' => TranscriptStatus.failed,
-//       _ => TranscriptStatus.idle,
-//     };
-//     return TranscriptionSidecar(
-//       status: status,
-//       transcript: json['transcript'] as String?,
-//       language: json['language'] as String?,
-//     );
-//   }
-
-//   Map<String, dynamic> toJson() => {
-//     'status': switch (status) {
-//       TranscriptStatus.done => 'done',
-//       TranscriptStatus.pending => 'pending',
-//       TranscriptStatus.failed => 'failed',
-//       TranscriptStatus.idle => 'idle',
-//     },
-//     'transcript': transcript,
-//     'language': language,
-//   };
-// }
-
-// class TranscriptionService {
-//   TranscriptionService._();
-
-//   // Groq's limit is 25MB — we use 20MB to stay safely under
-//   static const int _maxChunkBytes = 20 * 1024 * 1024;
-
-//   static String sidecarPath(String audioPath) {
-//     final dotIndex = audioPath.lastIndexOf('.');
-//     if (dotIndex == -1) return '$audioPath.json';
-//     return '${audioPath.substring(0, dotIndex)}.json';
-//   }
-
-//   static Future<TranscriptionSidecar> loadSidecar(String audioPath) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       if (!await file.exists()) return TranscriptionSidecar.idle;
-//       final content = await file.readAsString();
-//       final json = jsonDecode(content) as Map<String, dynamic>;
-//       return TranscriptionSidecar.fromJson(json);
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] loadSidecar error: $e');
-//       return TranscriptionSidecar.idle;
-//     }
-//   }
-
-//   static Future<void> saveSidecar(
-//     String audioPath,
-//     TranscriptionSidecar sidecar,
-//   ) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       await file.writeAsString(jsonEncode(sidecar.toJson()));
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] saveSidecar error: $e');
-//     }
-//   }
-
-//   static Future<void> deleteSidecar(String audioPath) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       if (await file.exists()) await file.delete();
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] deleteSidecar error: $e');
-//     }
-//   }
-
-//   // ─── Groq Whisper flow ────────────────────────────────────────────────────
-
-//   static Future<String> transcribeFile(
-//     String audioPath, {
-//     String? languageCode,
-//   }) async {
-//     final file = File(audioPath);
-//     if (!await file.exists()) {
-//       throw Exception('Audio file not found: $audioPath');
-//     }
-
-//     final totalBytes = await file.length();
-//     final sizeInMB = totalBytes / (1024 * 1024);
-//     debugPrint('[TranscriptionService] File size: ${sizeInMB.toStringAsFixed(1)}MB');
-
-//     // Split into chunks if over 20MB
-//     final chunkPaths = await _splitIntoChunks(audioPath, totalBytes);
-//     final wasChunked = chunkPaths.length > 1;
-
-//     debugPrint('[TranscriptionService] Chunks: ${chunkPaths.length}');
-
-//     try {
-//       final List<String> transcripts = [];
-
-//       for (int i = 0; i < chunkPaths.length; i++) {
-//         final chunkPath = chunkPaths[i];
-//         final chunkSizeMB = File(chunkPath).lengthSync() / (1024 * 1024);
-//         debugPrint(
-//           '[TranscriptionService] Transcribing chunk ${i + 1}/${chunkPaths.length} '
-//           '(${chunkSizeMB.toStringAsFixed(1)}MB): $chunkPath',
-//         );
-
-//         final transcript = await _transcribeChunk(
-//           chunkPath,
-//           languageCode: languageCode,
-//         );
-//         transcripts.add(transcript);
-//         debugPrint('[TranscriptionService] Chunk ${i + 1} done: $transcript');
-//       }
-
-//       return transcripts.join(' ').trim();
-//     } finally {
-//       if (wasChunked) {
-//         await _deleteChunks(chunkPaths, audioPath);
-//       }
-//     }
-//   }
-
-//   // ─── Chunk splitting (pure Dart, no ffmpeg) ───────────────────────────────
-
-//   static Future<List<String>> _splitIntoChunks(
-//     String audioPath,
-//     int totalBytes,
-//   ) async {
-//     if (totalBytes <= _maxChunkBytes) return [audioPath];
-
-//     final tmpDir = await getTemporaryDirectory();
-//     final ext = audioPath.split('.').last.toLowerCase();
-//     final List<String> chunkPaths = [];
-
-//     final raf = await File(audioPath).open(mode: FileMode.read);
-//     try {
-//       int offset = 0;
-//       int chunkIndex = 0;
-
-//       while (offset < totalBytes) {
-//         final remaining = totalBytes - offset;
-//         final size = remaining < _maxChunkBytes ? remaining : _maxChunkBytes;
-
-//         await raf.setPosition(offset);
-//         final bytes = await raf.read(size);
-
-//         final chunkPath =
-//             '${tmpDir.path}/groq_chunk_${chunkIndex}_${DateTime.now().millisecondsSinceEpoch}.$ext';
-//         await File(chunkPath).writeAsBytes(bytes);
-//         chunkPaths.add(chunkPath);
-
-//         debugPrint(
-//           '[TranscriptionService] Split chunk $chunkIndex: '
-//           '${offset}–${offset + size} bytes → $chunkPath',
-//         );
-
-//         offset += size;
-//         chunkIndex++;
-//       }
-//     } finally {
-//       await raf.close();
-//     }
-
-//     return chunkPaths;
-//   }
-
-//   static Future<void> _deleteChunks(
-//     List<String> chunkPaths,
-//     String originalPath,
-//   ) async {
-//     for (final path in chunkPaths) {
-//       if (path == originalPath) continue;
-//       try {
-//         final f = File(path);
-//         if (await f.exists()) await f.delete();
-//       } catch (e) {
-//         debugPrint('[TranscriptionService] deleteChunk error for $path: $e');
-//       }
-//     }
-//   }
-
-//   // ─── Single Groq Whisper request (no polling needed) ─────────────────────
-
-//   static Future<String> _transcribeChunk(
-//     String audioPath, {
-//     String? languageCode,
-//   }) async {
-//     final uri = Uri.parse(
-//       'https://api.groq.com/openai/v1/audio/transcriptions',
-//     );
-
-//     final ext = audioPath.split('.').last.toLowerCase();
-//     final mimeType = switch (ext) {
-//       'mp3' => 'audio/mpeg',
-//       'wav' => 'audio/wav',
-//       'aac' => 'audio/aac',
-//       'mp4' => 'audio/mp4',
-//       _ => 'audio/m4a',
-//     };
-
-//     final request = http.MultipartRequest('POST', uri)
-//       ..headers['Authorization'] = 'Bearer $kOpenAiApiKey'
-//       ..fields['model'] = 'whisper-large-v3'
-//       ..fields['response_format'] = 'json'
-//       ..files.add(
-//         await http.MultipartFile.fromPath(
-//           'file',
-//           audioPath,
-//           contentType: http.MediaType.parse(mimeType),
-//         ),
-//       );
-
-//     if (languageCode != null) {
-//       request.fields['language'] = languageCode;
-//     }
-
-//     debugPrint('[TranscriptionService] Sending to Groq...');
-//     final streamedResponse = await request.send();
-//     final response = await http.Response.fromStream(streamedResponse);
-
-//     if (response.statusCode == 200) {
-//       final json = jsonDecode(response.body) as Map<String, dynamic>;
-//       return (json['text'] as String? ?? '').trim();
-//     } else {
-//       throw Exception(
-//         'Groq transcription failed ${response.statusCode}: ${response.body}',
-//       );
-//     }
-//   }
-// }
-
-
-// GLADIA
-
-// import 'dart:convert';
-// import 'dart:io';
-// import 'package:flutter/foundation.dart';
-// import 'package:http/http.dart' as http;
-// import '../constants.dart';
-// import 'audio_chunker.dart';
-
-// enum TranscriptStatus { idle, pending, done, failed }
-
-// class TranscriptionSidecar {
-//   final TranscriptStatus status;
-//   final String? transcript;
-//   final String? language;
-
-//   const TranscriptionSidecar({
-//     required this.status,
-//     this.transcript,
-//     this.language,
-//   });
-
-//   static const idle = TranscriptionSidecar(status: TranscriptStatus.idle);
-
-//   factory TranscriptionSidecar.fromJson(Map<String, dynamic> json) {
-//     final statusStr = json['status'] as String? ?? 'idle';
-//     final status = switch (statusStr) {
-//       'done' => TranscriptStatus.done,
-//       'pending' => TranscriptStatus.pending,
-//       'failed' => TranscriptStatus.failed,
-//       _ => TranscriptStatus.idle,
-//     };
-//     return TranscriptionSidecar(
-//       status: status,
-//       transcript: json['transcript'] as String?,
-//       language: json['language'] as String?,
-//     );
-//   }
-
-//   Map<String, dynamic> toJson() => {
-//     'status': switch (status) {
-//       TranscriptStatus.done => 'done',
-//       TranscriptStatus.pending => 'pending',
-//       TranscriptStatus.failed => 'failed',
-//       TranscriptStatus.idle => 'idle',
-//     },
-//     'transcript': transcript,
-//     'language': language,
-//   };
-// }
-
-// class TranscriptionService {
-//   TranscriptionService._();
-
-//   static String sidecarPath(String audioPath) {
-//     final dotIndex = audioPath.lastIndexOf('.');
-//     if (dotIndex == -1) return '$audioPath.json';
-//     return '${audioPath.substring(0, dotIndex)}.json';
-//   }
-
-//   static Future<TranscriptionSidecar> loadSidecar(String audioPath) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       if (!await file.exists()) return TranscriptionSidecar.idle;
-//       final content = await file.readAsString();
-//       final json = jsonDecode(content) as Map<String, dynamic>;
-//       return TranscriptionSidecar.fromJson(json);
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] loadSidecar error: $e');
-//       return TranscriptionSidecar.idle;
-//     }
-//   }
-
-//   static Future<void> saveSidecar(
-//     String audioPath,
-//     TranscriptionSidecar sidecar,
-//   ) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       await file.writeAsString(jsonEncode(sidecar.toJson()));
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] saveSidecar error: $e');
-//     }
-//   }
-
-//   static Future<void> deleteSidecar(String audioPath) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       if (await file.exists()) await file.delete();
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] deleteSidecar error: $e');
-//     }
-//   }
-
-//   // ─── Gladia 3-step flow ───────────────────────────────────────────────────
-
-// static Future<String> transcribeFile(
-//   String audioPath, {
-//   String? languageCode,
-// }) async {
-//   final file = File(audioPath);
-//   if (!await file.exists()) {
-//     throw Exception('Audio file not found: $audioPath');
-//   }
-
-//   final sizeInMB = file.lengthSync() / (1024 * 1024);
-//   debugPrint('[TranscriptionService] File size: ${sizeInMB.toStringAsFixed(1)}MB');
-
-//   // Check duration — chunk if over Gladia's 8100s limit
-//   final duration = await AudioChunker.getDurationSeconds(audioPath);
-//   debugPrint('[TranscriptionService] Duration: ${duration?.toStringAsFixed(0)}s');
-
-//   final List<String> chunkPaths;
-//   final bool wasChunked;
-
-//   if (duration != null && duration > 8100) {
-//     debugPrint('[TranscriptionService] File exceeds limit, chunking...');
-//     chunkPaths = await AudioChunker.split(audioPath);
-//     wasChunked = true;
-//   } else {
-//     chunkPaths = [audioPath];
-//     wasChunked = false;
-//   }
-
-//   try {
-//     final List<String> transcripts = [];
-
-//     for (int i = 0; i < chunkPaths.length; i++) {
-//       final chunkPath = chunkPaths[i];
-//       debugPrint(
-//         '[TranscriptionService] Transcribing chunk ${i + 1}/${chunkPaths.length}: $chunkPath',
-//       );
-
-//       final audioUrl = await _uploadFile(chunkPath);
-//       final transcriptionId = await _submitTranscription(
-//         audioUrl,
-//         languageCode: languageCode,
-//       );
-//       final transcript = await _pollUntilDone(transcriptionId);
-//       transcripts.add(transcript);
-
-//       debugPrint('[TranscriptionService] Chunk ${i + 1} done: $transcript');
-//     }
-
-//     return transcripts.join(' ').trim();
-//   } finally {
-//     if (wasChunked) {
-//       await AudioChunker.deleteChunks(chunkPaths, audioPath);
-//     }
-//   }
-// }
-
-//   static Future<String> _uploadFile(String audioPath) async {
-//     final uri = Uri.parse('https://api.gladia.io/v2/upload');
-
-//     final ext = audioPath.split('.').last.toLowerCase();
-//     final mimeType = switch (ext) {
-//       'mp3' => 'audio/mpeg',
-//       'wav' => 'audio/wav',
-//       'aac' => 'audio/aac',
-//       'mp4' => 'audio/mp4',
-//       _ => 'audio/m4a',
-//     };
-
-//     final request = http.MultipartRequest('POST', uri)
-//       ..headers['x-gladia-key'] = kOpenAiApiKey
-//       ..files.add(
-//         await http.MultipartFile.fromPath(
-//           'audio',
-//           audioPath,
-//           contentType: http.MediaType.parse(mimeType),
-//         ),
-//       );
-
-//     final streamedResponse = await request.send();
-//     final response = await http.Response.fromStream(streamedResponse);
-
-//     if (response.statusCode == 200 || response.statusCode == 201) {
-//       final json = jsonDecode(response.body) as Map<String, dynamic>;
-//       return json['audio_url'] as String;
-//     } else {
-//       throw Exception(
-//         'Gladia upload failed ${response.statusCode}: ${response.body}',
-//       );
-//     }
-//   }
-
-//   static Future<String> _submitTranscription(
-//     String audioUrl, {
-//     String? languageCode,
-//   }) async {
-//     final uri = Uri.parse('https://api.gladia.io/v2/pre-recorded');
-
-//     final body = <String, dynamic>{
-//       'audio_url': audioUrl,
-//     };
-
-//     if (languageCode != null) {
-//       body['language'] = languageCode;
-//     } else {
-//       body['detect_language'] = true;
-//     }
-
-//     final response = await http.post(
-//       uri,
-//       headers: {
-//         'x-gladia-key': kOpenAiApiKey,
-//         'Content-Type': 'application/json',
-//       },
-//       body: jsonEncode(body),
-//     );
-
-//     if (response.statusCode == 200 || response.statusCode == 201) {
-//       final json = jsonDecode(response.body) as Map<String, dynamic>;
-//       return json['id'] as String;
-//     } else {
-//       throw Exception(
-//         'Gladia submit failed ${response.statusCode}: ${response.body}',
-//       );
-//     }
-//   }
-
-//   static Future<String> _pollUntilDone(String transcriptionId) async {
-//     final uri = Uri.parse(
-//       'https://api.gladia.io/v2/pre-recorded/$transcriptionId',
-//     );
-
-//     while (true) {
-//       await Future.delayed(const Duration(seconds: 3));
-
-//       final response = await http.get(
-//         uri,
-//         headers: {'x-gladia-key': kOpenAiApiKey},
-//       );
-
-//       if (response.statusCode == 200) {
-//         final json = jsonDecode(response.body) as Map<String, dynamic>;
-//         final status = json['status'] as String? ?? '';
-
-//         debugPrint('[TranscriptionService] Poll status: $status');
-
-//         if (status == 'done') {
-//           // Extract full transcript from utterances
-//           final result = json['result'] as Map<String, dynamic>?;
-//           final transcription = result?['transcription'] as Map<String, dynamic>?;
-//           final fullTranscript = transcription?['full_transcript'] as String? ?? '';
-//           return fullTranscript.trim();
-//         } else if (status == 'error') {
-//           throw Exception('Gladia error: ${json['error_message']}');
-//         }
-//         // status == 'queued' or 'processing' → keep polling
-//       } else {
-//         throw Exception(
-//           'Gladia poll failed ${response.statusCode}: ${response.body}',
-//         );
-//       }
-//     }
-//   }
-// }
-
-
-
-// assembly ai:
-
-// import 'dart:convert';
-// import 'dart:io';
-// import 'package:flutter/foundation.dart';
-// import 'package:http/http.dart' as http;
-// import '../constants.dart';
-
-// enum TranscriptStatus { idle, pending, done, failed }
-
-// class TranscriptionSidecar {
-//   final TranscriptStatus status;
-//   final String? transcript;
-//   final String? language;
-
-//   const TranscriptionSidecar({
-//     required this.status,
-//     this.transcript,
-//     this.language,
-//   });
-
-//   static const idle = TranscriptionSidecar(status: TranscriptStatus.idle);
-
-//   factory TranscriptionSidecar.fromJson(Map<String, dynamic> json) {
-//     final statusStr = json['status'] as String? ?? 'idle';
-//     final status = switch (statusStr) {
-//       'done' => TranscriptStatus.done,
-//       'pending' => TranscriptStatus.pending,
-//       'failed' => TranscriptStatus.failed,
-//       _ => TranscriptStatus.idle,
-//     };
-//     return TranscriptionSidecar(
-//       status: status,
-//       transcript: json['transcript'] as String?,
-//       language: json['language'] as String?,
-//     );
-//   }
-
-//   Map<String, dynamic> toJson() => {
-//     'status': switch (status) {
-//       TranscriptStatus.done => 'done',
-//       TranscriptStatus.pending => 'pending',
-//       TranscriptStatus.failed => 'failed',
-//       TranscriptStatus.idle => 'idle',
-//     },
-//     'transcript': transcript,
-//     'language': language,
-//   };
-// }
-
-// class TranscriptionService {
-//   TranscriptionService._();
-
-//   static String sidecarPath(String audioPath) {
-//     final dotIndex = audioPath.lastIndexOf('.');
-//     if (dotIndex == -1) return '$audioPath.json';
-//     return '${audioPath.substring(0, dotIndex)}.json';
-//   }
-
-//   static Future<TranscriptionSidecar> loadSidecar(String audioPath) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       if (!await file.exists()) return TranscriptionSidecar.idle;
-//       final content = await file.readAsString();
-//       final json = jsonDecode(content) as Map<String, dynamic>;
-//       return TranscriptionSidecar.fromJson(json);
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] loadSidecar error: $e');
-//       return TranscriptionSidecar.idle;
-//     }
-//   }
-
-//   static Future<void> saveSidecar(
-//     String audioPath,
-//     TranscriptionSidecar sidecar,
-//   ) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       await file.writeAsString(jsonEncode(sidecar.toJson()));
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] saveSidecar error: $e');
-//     }
-//   }
-
-//   static Future<void> deleteSidecar(String audioPath) async {
-//     try {
-//       final file = File(sidecarPath(audioPath));
-//       if (await file.exists()) await file.delete();
-//     } catch (e) {
-//       debugPrint('[TranscriptionService] deleteSidecar error: $e');
-//     }
-//   }
-
-//   // ─── AssemblyAI 3-step flow ───────────────────────────────────────────────
-
-//   static Future<String> transcribeFile(
-//     String audioPath, {
-//     String? languageCode,
-//   }) async {
-//     final file = File(audioPath);
-//     if (!await file.exists()) {
-//       throw Exception('Audio file not found: $audioPath');
-//     }
-
-//     // Step 1: Upload file to AssemblyAI
-//     debugPrint('[TranscriptionService] Uploading to AssemblyAI: $audioPath');
-//     final uploadUrl = await _uploadFile(audioPath);
-//     debugPrint('[TranscriptionService] Uploaded. URL: $uploadUrl');
-
-//     // Step 2: Submit transcription job
-//     final transcriptId = await _submitTranscription(
-//       uploadUrl,
-//       languageCode: languageCode,
-//     );
-//     debugPrint('[TranscriptionService] Job submitted. ID: $transcriptId');
-
-//     // Step 3: Poll until complete
-//     final transcript = await _pollUntilDone(transcriptId);
-//     debugPrint('[TranscriptionService] Done: $transcript');
-//     return transcript;
-//   }
-
-//   static Future<String> _uploadFile(String audioPath) async {
-//     final uri = Uri.parse('https://api.assemblyai.com/v2/upload');
-//     final fileBytes = await File(audioPath).readAsBytes();
-
-//     final response = await http.post(
-//       uri,
-//       headers: {
-//         'authorization': kOpenAiApiKey,
-//         'content-type': 'application/octet-stream',
-//       },
-//       body: fileBytes,
-//     );
-
-//     if (response.statusCode == 200) {
-//       final json = jsonDecode(response.body) as Map<String, dynamic>;
-//       return json['upload_url'] as String;
-//     } else {
-//       throw Exception('Upload failed ${response.statusCode}: ${response.body}');
-//     }
-//   }
-
-//   static Future<String> _submitTranscription(
-//     String audioUrl, {
-//     String? languageCode,
-//   }) async {
-//     final uri = Uri.parse('https://api.assemblyai.com/v2/transcript');
-
-//     final body = <String, dynamic>{
-//       'audio_url': audioUrl,
-//     };
-
-//     // AssemblyAI uses language_code param
-//     if (languageCode != null) {
-//       body['language_code'] = languageCode;
-//     } else {
-//       body['language_detection'] = true; // auto-detect
-//     }
-
-//     final response = await http.post(
-//       uri,
-//       headers: {
-//         'authorization': kOpenAiApiKey,
-//         'content-type': 'application/json',
-//       },
-//       body: jsonEncode(body),
-//     );
-
-//     if (response.statusCode == 200) {
-//       final json = jsonDecode(response.body) as Map<String, dynamic>;
-//       return json['id'] as String;
-//     } else {
-//       throw Exception(
-//         'Submit failed ${response.statusCode}: ${response.body}',
-//       );
-//     }
-//   }
-
-//   static Future<String> _pollUntilDone(String transcriptId) async {
-//     final uri = Uri.parse(
-//       'https://api.assemblyai.com/v2/transcript/$transcriptId',
-//     );
-
-//     while (true) {
-//       await Future.delayed(const Duration(seconds: 3));
-
-//       final response = await http.get(
-//         uri,
-//         headers: {'authorization': kOpenAiApiKey},
-//       );
-
-//       if (response.statusCode == 200) {
-//         final json = jsonDecode(response.body) as Map<String, dynamic>;
-//         final status = json['status'] as String;
-
-//         debugPrint('[TranscriptionService] Poll status: $status');
-
-//         if (status == 'completed') {
-//           return (json['text'] as String? ?? '').trim();
-//         } else if (status == 'error') {
-//           throw Exception('AssemblyAI error: ${json['error']}');
-//         }
-//         // status == 'queued' or 'processing' → keep polling
-//       } else {
-//         throw Exception(
-//           'Poll failed ${response.statusCode}: ${response.body}',
-//         );
-//       }
-//     }
-//   }
-// }

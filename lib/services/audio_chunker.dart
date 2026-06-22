@@ -6,7 +6,7 @@ import 'package:path_provider/path_provider.dart';
 class AudioChunker {
   AudioChunker._();
 
-  static const int chunkDurationSeconds = 3600; // 60 min
+  static const int chunkDurationSeconds = 1800; // 30 min
 
   /// Gets duration in seconds using just_audio (already in your project).
   static Future<double?> getDurationSeconds(String audioPath) async {
