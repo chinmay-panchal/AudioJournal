@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -14,6 +15,8 @@ class AudioRecordingTaskHandler extends TaskHandler {
   Stopwatch? _stopwatch;
   String? _filePath;
   bool _isRecording = false;
+  int _lastChunkRolledIndex = 0; // how many 30-min boundaries already rolled
+  int _chunkFileIndex = 0;       // monotonic counter for chunk file names
 
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
@@ -66,7 +69,17 @@ class AudioRecordingTaskHandler extends TaskHandler {
     if (_isRecording && _stopwatch != null) {
       final elapsedMs = _stopwatch!.elapsedMilliseconds;
       final duration = Duration(milliseconds: elapsedMs);
-      
+
+      // ── Detect 30-minute chunk boundary ──────────────────────────────────
+      const chunkIntervalMs = 30 * 60 * 1000;
+      final chunksDue = elapsedMs ~/ chunkIntervalMs;
+      if (chunksDue > _lastChunkRolledIndex) {
+        // Update index synchronously (before any await) so that if onRepeatEvent
+        // fires again before the roll finishes, we don't double-roll.
+        _lastChunkRolledIndex = chunksDue;
+        unawaited(_rollChunkAndRestart());
+      }
+
       final hours = duration.inHours.toString().padLeft(2, '0');
       final minutes = (duration.inMinutes % 60).toString().padLeft(2, '0');
       final seconds = (duration.inSeconds % 60).toString().padLeft(2, '0');
@@ -80,6 +93,53 @@ class AudioRecordingTaskHandler extends TaskHandler {
       FlutterForegroundTask.sendDataToMain({
         'status': 'recording',
         'durationMs': elapsedMs,
+      });
+    }
+  }
+
+  /// Silently rolls a 30-min chunk on Android:
+  /// stops the recorder → copies bytes to temp file → signals main isolate
+  /// → restarts immediately at the same path. The UI never sees a stop.
+  Future<void> _rollChunkAndRestart() async {
+    if (!_isRecording || _audioRecorder == null || _filePath == null) return;
+    try {
+      // 1. Stop current segment
+      final completedPath = await _audioRecorder!.stop();
+
+      // 2. Copy segment bytes to a temp chunk file
+      String? chunkPath;
+      if (completedPath != null && File(completedPath).existsSync()) {
+        final tmpDir = await getTemporaryDirectory();
+        final ext = completedPath.split('.').last;
+        chunkPath =
+            '${tmpDir.path}/android_live_chunk_${_chunkFileIndex}_'
+            '${DateTime.now().millisecondsSinceEpoch}.$ext';
+        await File(completedPath).copy(chunkPath);
+        _chunkFileIndex++;
+      }
+
+      // 3. Signal main isolate — it will transcribe + upload this chunk
+      if (chunkPath != null) {
+        FlutterForegroundTask.sendDataToMain({
+          'status': 'chunk_ready',
+          'chunkPath': chunkPath,
+        });
+      }
+
+      // 4. Restart recorder immediately at same path (overwrites previous segment)
+      const config = RecordConfig(
+        encoder: AudioEncoder.wav,
+        sampleRate: 16000,
+        numChannels: 1,
+        autoGain: true,
+        echoCancel: true,
+        noiseSuppress: true,
+      );
+      await _audioRecorder!.start(config, path: _filePath!);
+    } catch (e) {
+      FlutterForegroundTask.sendDataToMain({
+        'status': 'chunk_roll_error',
+        'error': e.toString(),
       });
     }
   }

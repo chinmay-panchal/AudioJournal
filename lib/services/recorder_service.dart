@@ -47,6 +47,14 @@ class RecorderService extends ChangeNotifier {
   Stopwatch? _iosStopwatch;
   Timer? _iosTimer;
 
+  // ── Live-chunking state ─────────────────────────────────────────────
+  Timer? _chunkRollTimer;                    // iOS: fires every 30 min
+  Completer<void>? _chunkRollCompleter;      // guards concurrent roll + stop
+  int _chunkIndex = 0;                       // intermediate chunks rolled
+  bool _hasLiveChunking = false;             // true once first chunk is rolled
+  Future<String?>? _lastTranscriptIdFuture;  // sequential-upload gate
+  final List<String> _liveChunkTranscripts = []; // per-chunk texts (in order)
+
   Future<void> init() async {
     if (Platform.isAndroid) {
       await BackgroundService.init();
@@ -54,6 +62,9 @@ class RecorderService extends ChangeNotifier {
       await checkActiveAndroidService();
     }
     await loadRecordings();
+    // Any recording still marked 'pending' after startup was interrupted by a
+    // crash or force-quit. Reset it to 'failed' so the user can tap Retry.
+    await _resetStalePendingRecordings();
   }
 
   void _onAndroidTaskData(Object data) {
@@ -63,20 +74,60 @@ class RecorderService extends ChangeNotifier {
         _isRecording = true;
         _duration = Duration(milliseconds: data['durationMs'] ?? 0);
         notifyListeners();
+      } else if (status == 'chunk_ready') {
+        // A 30-min chunk has been silently rolled by the background service.
+        // Transcribe it immediately; POST to backend waits for the previous
+        // chunk's transcript_id via the Completer chain.
+        final chunkPath = data['chunkPath'] as String?;
+        if (chunkPath != null) {
+          _hasLiveChunking = true;
+          final slotIndex = _liveChunkTranscripts.length;
+          _liveChunkTranscripts.add('');
+          final previousFuture = _lastTranscriptIdFuture;
+          final completer = Completer<String?>();
+          _lastTranscriptIdFuture = completer.future;
+          _processLiveChunk(
+            chunkPath: chunkPath,
+            previousTranscriptIdFuture: previousFuture,
+            isLastChunk: false,
+            completer: completer,
+            slotIndex: slotIndex,
+          );
+        }
       } else if (status == 'stopped') {
         _isRecording = false;
-        _duration = Duration(milliseconds: data['durationMs'] ?? 0);
+        final finalDurationMs = data['durationMs'] as int? ?? 0;
         _currentRecordingPath = data['filePath'];
+        _duration = Duration.zero; // ← reset timer display to 00:00:00
         notifyListeners();
         loadRecordings().then((_) {
           if (_currentRecordingPath != null) {
-            TranscriptionService.loadSidecar(_currentRecordingPath!).then((
-              sidecar,
-            ) {
-              if (sidecar.status == TranscriptStatus.idle) {
-                _triggerTranscription(_currentRecordingPath!);
-              }
-            });
+            if (_hasLiveChunking) {
+              // Live-chunked: treat the final segment as the last chunk.
+              _hasLiveChunking = false;
+              final slotIndex = _liveChunkTranscripts.length;
+              _liveChunkTranscripts.add('');
+              final previousFuture = _lastTranscriptIdFuture;
+              final completer = Completer<String?>();
+              _lastTranscriptIdFuture = null;
+              _processLiveChunk(
+                chunkPath: _currentRecordingPath!,
+                previousTranscriptIdFuture: previousFuture,
+                isLastChunk: true,
+                completer: completer,
+                slotIndex: slotIndex,
+                originalRecordingPath: _currentRecordingPath!,
+                totalDurationMs: finalDurationMs,
+              );
+            } else {
+              TranscriptionService.loadSidecar(_currentRecordingPath!).then((
+                sidecar,
+              ) {
+                if (sidecar.status == TranscriptStatus.idle) {
+                  _triggerTranscription(_currentRecordingPath!);
+                }
+              });
+            }
           }
         });
       } else if (status == 'error') {
@@ -156,6 +207,11 @@ class RecorderService extends ChangeNotifier {
       _isRecording = true;
       _duration = Duration.zero;
       _currentRecordingPath = tempFilePath;
+      // Reset live-chunking state for this Android session.
+      _chunkIndex = 0;
+      _hasLiveChunking = false;
+      _lastTranscriptIdFuture = null;
+      _liveChunkTranscripts.clear();
       notifyListeners();
       await BackgroundService.start(tempFilePath);
     } else if (Platform.isIOS) {
@@ -190,6 +246,16 @@ class RecorderService extends ChangeNotifier {
       await _iosRecorder!.start(config, path: tempFilePath);
       _iosStopwatch = Stopwatch()..start();
 
+      // Reset and arm live-chunking state for this iOS session.
+      _chunkIndex = 0;
+      _hasLiveChunking = false;
+      _lastTranscriptIdFuture = null;
+      _liveChunkTranscripts.clear();
+      // Schedule a silent chunk roll every 30 minutes.
+      _chunkRollTimer = Timer.periodic(const Duration(minutes: 30), (_) {
+        _rollChunkIOS();
+      });
+
       _iosTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) {
         if (_iosStopwatch != null) {
           _duration = _iosStopwatch!.elapsed;
@@ -209,11 +275,21 @@ class RecorderService extends ChangeNotifier {
       // Android path: transcription is triggered inside _onAndroidTaskData
       // after the file is fully written and loadRecordings() completes.
     } else if (Platform.isIOS) {
+      // Cancel the chunk-roll timer synchronously first so no new roll can
+      // start after this point.
+      _chunkRollTimer?.cancel();
+      _chunkRollTimer = null;
+
       _iosTimer?.cancel();
       _iosTimer = null;
       _iosStopwatch?.stop();
       final elapsedMs = _iosStopwatch?.elapsedMilliseconds ?? 0;
       _iosStopwatch = null;
+
+      // Wait for any in-progress chunk roll to finish before touching the recorder.
+      if (_chunkRollCompleter != null) {
+        await _chunkRollCompleter!.future.catchError((_) {});
+      }
 
       await _stopSilentAudioIos();
 
@@ -240,13 +316,248 @@ class RecorderService extends ChangeNotifier {
       }
 
       _isRecording = false;
+      _duration = Duration.zero; // ← reset timer display to 00:00:00
       notifyListeners();
       await loadRecordings();
 
       if (finalPath != null) {
-        _triggerTranscription(finalPath);
+        if (_hasLiveChunking) {
+          // Live-chunked recording: process the final segment and request summary.
+          _hasLiveChunking = false;
+          final slotIndex = _liveChunkTranscripts.length;
+          _liveChunkTranscripts.add('');
+          final previousFuture = _lastTranscriptIdFuture;
+          final completer = Completer<String?>();
+          _lastTranscriptIdFuture = null;
+          _processLiveChunk(
+            chunkPath: finalPath,
+            previousTranscriptIdFuture: previousFuture,
+            isLastChunk: true,
+            completer: completer,
+            slotIndex: slotIndex,
+            originalRecordingPath: finalPath,
+            totalDurationMs: elapsedMs,
+          );
+        } else {
+          // Standard path: recording < 30 min, use existing pipeline.
+          _triggerTranscription(finalPath);
+        }
       }
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // iOS Live-chunking helpers
+  // ---------------------------------------------------------------------------
+
+  /// Rolls the current iOS recording segment into a temp chunk file and
+  /// immediately restarts the recorder at the same path — all without changing
+  /// [_isRecording] or the UI timer. Called by the 30-min [_chunkRollTimer].
+  Future<void> _rollChunkIOS() async {
+    if (_iosRecorder == null || _currentRecordingPath == null) return;
+
+    _chunkRollCompleter = Completer<void>();
+    _hasLiveChunking = true;
+
+    // Reserve a slot so transcript order is maintained even if Gemini calls
+    // for different chunks resolve out of order.
+    final slotIndex = _liveChunkTranscripts.length;
+    _liveChunkTranscripts.add('');
+
+    try {
+      // ── 1. Stop current segment (silent — no UI state change) ─────────
+      String? completedPath;
+      try {
+        completedPath = await _iosRecorder!.stop();
+      } catch (e) {
+        debugPrint('[RecorderService] _rollChunkIOS: stop error: $e');
+      }
+
+      // ── 2. Copy completed segment to a temp chunk file ───────────────
+      String? chunkPath;
+      if (completedPath != null && File(completedPath).existsSync()) {
+        try {
+          final tmpDir = await getTemporaryDirectory();
+          final ext = completedPath.split('.').last;
+          chunkPath =
+              '${tmpDir.path}/live_chunk_${_chunkIndex}_'
+              '${DateTime.now().millisecondsSinceEpoch}.$ext';
+          await File(completedPath).copy(chunkPath);
+          _chunkIndex++;
+          debugPrint('[RecorderService] Rolled chunk \${_chunkIndex - 1} → $chunkPath');
+        } catch (e) {
+          debugPrint('[RecorderService] _rollChunkIOS: copy error: $e');
+        }
+      }
+
+      // ── 3. Restart recorder immediately at same path (overwrites) ─────
+      try {
+        const config = RecordConfig(
+          encoder: AudioEncoder.wav,
+          sampleRate: 16000,
+          numChannels: 1,
+          autoGain: true,
+          echoCancel: true,
+          noiseSuppress: true,
+        );
+        await _iosRecorder!.start(config, path: _currentRecordingPath!);
+        debugPrint('[RecorderService] Recorder restarted at $_currentRecordingPath');
+      } catch (e) {
+        debugPrint('[RecorderService] _rollChunkIOS: restart error: $e');
+      }
+
+      // ── 4. Kick off background transcription for this chunk ──────────
+      if (chunkPath != null) {
+        final previousFuture = _lastTranscriptIdFuture;
+        final completer = Completer<String?>();
+        _lastTranscriptIdFuture = completer.future;
+        _processLiveChunk(
+          chunkPath: chunkPath,
+          previousTranscriptIdFuture: previousFuture,
+          isLastChunk: false,
+          completer: completer,
+          slotIndex: slotIndex,
+        );
+      }
+    } finally {
+      _chunkRollCompleter!.complete();
+      _chunkRollCompleter = null;
+    }
+  }
+
+  /// Processes a single live chunk through the full pipeline:
+  ///
+  ///   [silence removal] → [Gemini transcription]  (both start immediately)
+  ///                               ↓
+  ///                    [await previous transcript_id]  (waits only if needed)
+  ///                               ↓
+  ///                    [POST /transcribe/simple]  (sequential per chunk)
+  ///
+  /// [completer] is resolved with the returned transcript_id so the next
+  /// chunk can await it before its own POST — preventing out-of-order appends.
+  void _processLiveChunk({
+    required String chunkPath,
+    required Future<String?>? previousTranscriptIdFuture,
+    required bool isLastChunk,
+    required Completer<String?> completer,
+    required int slotIndex,
+    String? originalRecordingPath, // sidecar target — only for the last chunk
+    int? totalDurationMs,
+  }) {
+    final languageCode = _selectedLanguage.apiCode;
+
+    if (isLastChunk && originalRecordingPath != null) {
+      _setTranscriptStatus(originalRecordingPath, TranscriptStatus.pending);
+    }
+
+    () async {
+      try {
+        // ── Phase 1: Silence removal (starts immediately) ────────────────
+        final cleanPath = await removeSilence(chunkPath);
+
+        // ── Phase 2: Gemini transcription (does NOT wait for transcript_id) ──
+        String transcriptText = '';
+        try {
+          transcriptText = await TranscriptionService.transcribeChunkWithGemini(
+            cleanPath,
+            languageCode: languageCode,
+          );
+          _liveChunkTranscripts[slotIndex] = transcriptText;
+          debugPrint(
+            '[RecorderService] Chunk $slotIndex transcribed: '
+            '${transcriptText.length} chars',
+          );
+        } finally {
+          // Clean up silence-removed file (keep original if paths differ)
+          if (cleanPath != chunkPath) {
+            try { File(cleanPath).deleteSync(); } catch (_) {}
+          }
+        }
+
+        // ── Phase 3: Await previous chunk's transcript_id ───────────────
+        // Gemini is already done; this wait is typically zero or very short.
+        String? transcriptId;
+        if (previousTranscriptIdFuture != null) {
+          try {
+            transcriptId = await previousTranscriptIdFuture;
+          } catch (e) {
+            debugPrint(
+              '[RecorderService] Previous chunk upload failed, '
+              'continuing without transcript_id: $e',
+            );
+          }
+        }
+
+        // ── Phase 4: POST to backend ───────────────────────────────
+        final filename = chunkPath.split('/').last;
+        final result = await TranscriptionService.uploadChunkToBackend(
+          transcriptText: transcriptText,
+          audioFilename: filename,
+          transcriptId: transcriptId,
+          isLastChunk: isLastChunk,
+        );
+        debugPrint(
+          '[RecorderService] Chunk $slotIndex uploaded → id: ${result.transcriptId}',
+        );
+        completer.complete(result.transcriptId);
+
+        // ── Phase 5: Apply result to UI (last chunk only) ──────────────
+        if (isLastChunk && originalRecordingPath != null) {
+          final fullTranscript = _liveChunkTranscripts.join('\n\n').trim();
+          final rec = _findByPath(originalRecordingPath);
+          final sidecar = TranscriptionSidecar(
+            status: TranscriptStatus.done,
+            transcript: fullTranscript,
+            summary: result.summaryText ?? '',
+            title: result.summaryTitle,
+            language: languageCode,
+            durationMs: totalDurationMs ?? rec?.duration.inMilliseconds,
+          );
+          await TranscriptionService.saveSidecar(originalRecordingPath, sidecar);
+          _applyTranscriptSidecar(originalRecordingPath, sidecar);
+
+          // Auto-rename from AI title
+          if (result.summaryTitle != null && result.summaryTitle!.isNotEmpty) {
+            final renameTarget = result.summaryTitle!
+                .replaceAll(RegExp(r'[^\w\s]'), '')
+                .trim()
+                .replaceAll(RegExp(r'\s+'), '_');
+            if (renameTarget.isNotEmpty) {
+              final r = _findByPath(originalRecordingPath);
+              if (r != null) renameRecording(r, renameTarget);
+            }
+          }
+          _liveChunkTranscripts.clear();
+        }
+
+        // Clean up temp chunk file (never delete the final recording file)
+        if (chunkPath != originalRecordingPath) {
+          try {
+            final f = File(chunkPath);
+            if (await f.exists()) await f.delete();
+          } catch (e) {
+            debugPrint('[RecorderService] Error deleting chunk temp file: $e');
+          }
+        }
+      } catch (e) {
+        debugPrint(
+          '[RecorderService] _processLiveChunk error (slot $slotIndex): $e',
+        );
+        if (!completer.isCompleted) completer.completeError(e);
+
+        if (isLastChunk && originalRecordingPath != null) {
+          final rec = _findByPath(originalRecordingPath);
+          final sidecar = TranscriptionSidecar(
+            status: TranscriptStatus.failed,
+            language: languageCode,
+            durationMs: totalDurationMs ?? rec?.duration.inMilliseconds,
+          );
+          await TranscriptionService.saveSidecar(originalRecordingPath, sidecar);
+          _applyTranscriptSidecar(originalRecordingPath, sidecar);
+          _liveChunkTranscripts.clear();
+        }
+      }
+    }();
   }
 
   // ---------------------------------------------------------------------------
@@ -497,8 +808,37 @@ class RecorderService extends ChangeNotifier {
   }
 
   /// Public method to retry a failed transcription.
+  ///
+  /// Always uses the "whole-file" path (same as imported audio): the entire
+  /// audio is sent to Gemini in one request, then posted to the backend with
+  /// [generate_summary=true]. This is simpler and more robust than the
+  /// live-chunking path — ideal after a backend disconnect, Dio error, or crash.
   void retryTranscription(Recording recording) {
-    _triggerTranscription(recording.path);
+    _triggerTranscription(recording.path, isImported: true);
+  }
+
+  /// Called once on startup. Resets any recording stuck in [TranscriptStatus.pending]
+  /// — which means the app was killed or crashed before transcription finished.
+  /// Marking them [failed] makes the Retry button visible in the UI.
+  Future<void> _resetStalePendingRecordings() async {
+    bool changed = false;
+    for (final rec in _recordings) {
+      if (rec.transcriptStatus == TranscriptStatus.pending) {
+        debugPrint(
+          '[RecorderService] Stale pending detected: ${rec.path} — marking failed',
+        );
+        final sidecar = TranscriptionSidecar(
+          status: TranscriptStatus.failed,
+          durationMs: rec.duration == Duration.zero
+              ? null
+              : rec.duration.inMilliseconds,
+        );
+        await TranscriptionService.saveSidecar(rec.path, sidecar);
+        rec.applyTranscript(sidecar);
+        changed = true;
+      }
+    }
+    if (changed) notifyListeners();
   }
 
   /// Sets the transcript status on the matching in-memory recording and notifies.
@@ -710,6 +1050,7 @@ class RecorderService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _chunkRollTimer?.cancel();
     _iosTimer?.cancel();
     _silentPlayer?.dispose();
     _iosRecorder?.dispose();

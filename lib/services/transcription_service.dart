@@ -145,6 +145,15 @@ class TranscriptionService {
         );
       } catch (e) {
         if (attempt == retries - 1) rethrow;
+        
+        final errorStr = e.toString();
+        // Do not trigger the long rate-limit retry delay for backend connection
+        // or DB save errors. Fail immediately so the UI shows the Retry button.
+        if (errorStr.contains('Error saving transcription') ||
+            errorStr.contains('Failed to save transcription')) {
+          rethrow;
+        }
+
         final waitSeconds = 40 * (attempt + 1);
         debugPrint(
           '[TranscriptionService] Rate limited, retrying in ${waitSeconds}s (attempt ${attempt + 1}/$retries)...',
@@ -215,13 +224,7 @@ class TranscriptionService {
         );
 
         if (saveResp.statusCode != 200 && saveResp.statusCode != 201) {
-          return TranscriptionResult(
-            transcript: finalTranscript,
-            summary:
-                'Failed to save transcription (Status: ${saveResp.statusCode}). Summary generation aborted.',
-            title: 'Recording',
-            language: languageCode ?? '',
-          );
+          throw Exception('Failed to save transcription (Status: ${saveResp.statusCode}).');
         }
 
         final body = saveResp.data;
@@ -232,7 +235,10 @@ class TranscriptionService {
           // Backend nests summary as: { summary: { title: "...", summary: "..." } }
           final summaryField = body['summary'];
           if (summaryField is Map<String, dynamic>) {
-            summaryText = _asString(summaryField['summary']) ?? '';
+            summaryText =
+                _asString(summaryField['summary_text']) ??
+                _asString(summaryField['summary']) ??
+                '';
             final parsedTitle = _asString(summaryField['title']);
             if (parsedTitle != null && parsedTitle.isNotEmpty) {
               title = parsedTitle;
@@ -250,13 +256,7 @@ class TranscriptionService {
         );
       } catch (e) {
         debugPrint('[TranscriptionService] [Imported] DB Save error: $e');
-        return TranscriptionResult(
-          transcript: finalTranscript,
-          summary:
-              'Error saving transcription: $e. Summary generation aborted.',
-          title: 'Recording',
-          language: languageCode ?? '',
-        );
+        throw Exception('Error saving transcription: $e');
       }
     }
 
@@ -394,13 +394,7 @@ CRITICAL: The "start" and "end" timestamps MUST be valid floating point values i
             debugPrint(
               '[TranscriptionService] Save API failed for chunk ${i + 1}. Skipping further steps.',
             );
-            return TranscriptionResult(
-              transcript: allTranscripts.join('\n\n').trim(),
-              summary:
-                  'Failed to save transcription (Status: ${saveResp.statusCode}). Summary generation aborted.',
-              title: 'Recording',
-              language: languageCode ?? '',
-            );
+            throw Exception('Failed to save transcription (Status: ${saveResp.statusCode}).');
           }
 
           final body = saveResp.data;
@@ -415,7 +409,10 @@ CRITICAL: The "start" and "end" timestamps MUST be valid floating point values i
               // Backend nests summary as: { summary: { title: "...", summary: "..." } }
               final summaryField = body['summary'];
               if (summaryField is Map<String, dynamic>) {
-                summaryText = _asString(summaryField['summary']) ?? '';
+                summaryText =
+                    _asString(summaryField['summary_text']) ??
+                    _asString(summaryField['summary']) ??
+                    '';
                 final parsedTitle = _asString(summaryField['title']);
                 if (parsedTitle != null && parsedTitle.isNotEmpty) {
                   title = parsedTitle;
@@ -427,13 +424,7 @@ CRITICAL: The "start" and "end" timestamps MUST be valid floating point values i
           }
         } catch (e) {
           debugPrint('[TranscriptionService] DB Save chunk ${i + 1} error: $e');
-          return TranscriptionResult(
-            transcript: allTranscripts.join('\n\n').trim(),
-            summary:
-                'Error saving transcription: $e. Summary generation aborted.',
-            title: 'Recording',
-            language: languageCode ?? '',
-          );
+          throw Exception('Error saving transcription: $e');
         }
       }
 
@@ -508,6 +499,157 @@ CRITICAL: The "start" and "end" timestamps MUST be valid floating point values i
     // Fallback: numbers, bools, etc.
     return value.toString();
   }
+
+  // ─── Live-chunk helpers (used by RecorderService live-chunking pipeline) ─────
+
+  /// Transcribes a single audio file using Gemini only and returns plain text.
+  /// Caller is responsible for silence removal and temp-file cleanup.
+  static Future<String> transcribeChunkWithGemini(
+    String audioPath, {
+    String? languageCode,
+  }) async {
+    final file = File(audioPath);
+    if (!await file.exists()) {
+      throw Exception('[TranscriptionService] Chunk file not found: $audioPath');
+    }
+
+    final audioBytes = await file.readAsBytes();
+    final ext = audioPath.split('.').last.toLowerCase();
+    final mimeType = _mimeType(ext);
+
+    const prompt =
+        '''You are an audio transcription assistant. Transcribe the following audio file.
+Return the transcription as a JSON object matching exactly this schema:
+{
+  "segments": [
+    {"start": 0.0, "end": 2.5, "text": "actual transcribed text here"}
+  ]
+}
+
+Note: Since this is a transcription task, please provide the actual transcribed text
+and reasonable timestamps for each segment in total seconds. Do NOT include speaker information.
+CRITICAL: The "start" and "end" timestamps MUST be valid floating point values in total seconds
+(e.g., 60.5 for 1 minute and 0.5 seconds). DO NOT use formatted strings or multiple decimals like 1.0.66.''';
+
+    final response = await _model.generateContent([
+      Content.multi([DataPart(mimeType, audioBytes), TextPart(prompt)]),
+    ]);
+
+    final rawGemini = response.text ?? '';
+    debugPrint(
+      '[TranscriptionService] transcribeChunkWithGemini: ${rawGemini.length} chars',
+    );
+
+    String transcriptText = '';
+    try {
+      String jsonStr = rawGemini;
+      if (jsonStr.contains('```json')) {
+        jsonStr = jsonStr.split('```json')[1].split('```')[0].trim();
+      } else if (jsonStr.contains('```')) {
+        jsonStr = jsonStr.split('```')[1].trim();
+      } else {
+        final firstBracket = jsonStr.indexOf(RegExp(r'[\{\[]'));
+        final lastBracket = jsonStr.lastIndexOf(RegExp(r'[\}\]]'));
+        if (firstBracket != -1 && lastBracket != -1 && lastBracket > firstBracket) {
+          jsonStr = jsonStr.substring(firstBracket, lastBracket + 1);
+        }
+      }
+      final jsonObj = jsonDecode(jsonStr);
+      if (jsonObj is Map<String, dynamic>) {
+        if (jsonObj.containsKey('segments')) {
+          transcriptText = (jsonObj['segments'] as List<dynamic>)
+              .map((s) => s['text']?.toString() ?? '')
+              .join(' ');
+        } else if (jsonObj.containsKey('text')) {
+          transcriptText = jsonObj['text'] as String;
+        } else {
+          transcriptText = rawGemini;
+        }
+      } else if (jsonObj is List<dynamic>) {
+        transcriptText = jsonObj
+            .map((s) => s['text']?.toString() ?? '')
+            .join(' ');
+      }
+    } catch (e) {
+      debugPrint('[TranscriptionService] transcribeChunkWithGemini parse error: $e');
+      transcriptText = rawGemini;
+    }
+    return transcriptText.trim();
+  }
+
+  /// Posts a single chunk's transcript text to `/transcribe/simple`.
+  ///
+  /// - First chunk  → omit [transcriptId]; backend creates session and returns ID.
+  /// - Middle chunks → supply [transcriptId] from previous call to append.
+  /// - Last chunk   → set [isLastChunk] = true to request inline summary.
+  ///
+  /// Returns a [ChunkUploadResult] with the session [transcriptId] and, for the
+  /// last chunk, the generated [summaryText] / [summaryTitle].
+  static Future<ChunkUploadResult> uploadChunkToBackend({
+    required String transcriptText,
+    required String audioFilename,
+    String? transcriptId,
+    bool isLastChunk = false,
+  }) async {
+    final formData = dio.FormData.fromMap({
+      'transcript_text': transcriptText,
+      'audio_filename': audioFilename,
+    });
+    final queryParameters = <String, dynamic>{
+      if (transcriptId != null) 'transcript_id': transcriptId,
+      if (isLastChunk) 'generate_summary': true,
+    };
+    debugPrint(
+      '[TranscriptionService] uploadChunkToBackend '
+      'file=$audioFilename id=$transcriptId isLast=$isLastChunk',
+    );
+
+    final saveResp = await ApiService().post(
+      '/transcribe/simple',
+      queryParameters: queryParameters,
+      data: formData,
+    );
+
+    if (saveResp.statusCode != 200 && saveResp.statusCode != 201) {
+      throw Exception(
+        '[TranscriptionService] uploadChunkToBackend: HTTP ${saveResp.statusCode}',
+      );
+    }
+
+    final body = saveResp.data;
+    debugPrint('[TranscriptionService] uploadChunkToBackend response: $body');
+
+    String? returnedId;
+    String? summaryText;
+    String? summaryTitle;
+
+    if (body is Map<String, dynamic>) {
+      returnedId = _asString(body['transcript_id']);
+      if (isLastChunk) {
+        final summaryField = body['summary'];
+        if (summaryField is Map<String, dynamic>) {
+          summaryText =
+              _asString(summaryField['summary_text']) ??
+              _asString(summaryField['summary']);
+          summaryTitle = _asString(summaryField['title']);
+        } else {
+          summaryText = _asString(summaryField);
+        }
+      }
+    }
+
+    if (returnedId == null) {
+      throw Exception(
+        '[TranscriptionService] uploadChunkToBackend: no transcript_id in response',
+      );
+    }
+
+    return ChunkUploadResult(
+      transcriptId: returnedId,
+      summaryText: summaryText,
+      summaryTitle: summaryTitle,
+    );
+  }
 }
 
 class TranscriptionResult {
@@ -521,5 +663,20 @@ class TranscriptionResult {
     required this.summary,
     this.title = '',
     required this.language,
+  });
+}
+
+/// Returned by [TranscriptionService.uploadChunkToBackend].
+/// Contains the backend session ID (used to chain subsequent chunk uploads)
+/// and, for the last chunk, the AI-generated summary and title.
+class ChunkUploadResult {
+  final String transcriptId;
+  final String? summaryText;
+  final String? summaryTitle;
+
+  const ChunkUploadResult({
+    required this.transcriptId,
+    this.summaryText,
+    this.summaryTitle,
   });
 }
