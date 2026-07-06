@@ -1,22 +1,18 @@
 import 'package:flutter/material.dart';
-import 'register_screen.dart';
-import 'forgot_password_screen.dart';
-import 'main_screen.dart';
 import '../services/auth_service.dart';
+import 'otp_verification_screen.dart';
 
-class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+class ForgotPasswordScreen extends StatefulWidget {
+  const ForgotPasswordScreen({super.key});
 
   @override
-  State<LoginScreen> createState() => _LoginScreenState();
+  State<ForgotPasswordScreen> createState() => _ForgotPasswordScreenState();
 }
 
-class _LoginScreenState extends State<LoginScreen> {
+class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
-  final _passwordController = TextEditingController();
   
-  bool _obscurePassword = true;
   bool _isLoading = false;
   String? _errorMessage;
 
@@ -30,11 +26,10 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   void dispose() {
     _emailController.dispose();
-    _passwordController.dispose();
     super.dispose();
   }
 
-  Future<void> _handleLogin() async {
+  Future<void> _handleResetRequest() async {
     if (!_formKey.currentState!.validate()) return;
 
     setState(() {
@@ -43,22 +38,15 @@ class _LoginScreenState extends State<LoginScreen> {
     });
 
     try {
-      await AuthService().login(
-        _emailController.text.trim(),
-        _passwordController.text,
-      );
-      // Explicitly clear the navigation stack and go to home.
-      // We cannot rely solely on the AuthService ChangeNotifier rebuild
-      // because this LoginScreen may have been pushed onto a navigator stack
-      // (e.g. after signup redirect), which hides the root widget rebuild.
+      await AuthService().requestPasswordReset(_emailController.text.trim());
       if (mounted) {
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const MainScreen()),
-          (route) => false, // remove ALL prior routes
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => OtpVerificationScreen(email: _emailController.text.trim()),
+          ),
         );
       }
     } catch (e) {
-      debugPrint('[LoginScreen] Login form submission error: $e');
       if (mounted) {
         setState(() {
           _errorMessage = e.toString().replaceAll('Exception: ', '');
@@ -77,10 +65,15 @@ class _LoginScreenState extends State<LoginScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: _textPrim),
+      ),
       body: SafeArea(
         child: Center(
           child: SingleChildScrollView(
-            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 40.0),
+            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 20.0),
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               crossAxisAlignment: CrossAxisAlignment.center,
@@ -97,30 +90,20 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                     borderRadius: BorderRadius.circular(16),
                   ),
-                  child: const Icon(Icons.mic, color: Colors.white, size: 28),
+                  child: const Icon(Icons.lock_reset, color: Colors.white, size: 28),
                 ),
                 const SizedBox(height: 16),
                 const Text(
-                  'Voicenote AI',
+                  'Forgot Password',
                   style: TextStyle(
                     color: _textPrim,
                     fontSize: 24,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
-                const SizedBox(height: 8),
-                const Text(
-                  'speak • summarise • remember',
-                  style: TextStyle(
-                    color: _textMut,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 1.2,
-                  ),
-                ),
                 const SizedBox(height: 48),
                 
-                // Login Card
+                // Forgot Password Card
                 Container(
                   width: double.infinity,
                   constraints: const BoxConstraints(maxWidth: 400),
@@ -143,7 +126,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         const Text(
-                          'Welcome back',
+                          'Reset your password',
                           style: TextStyle(
                             color: _textPrim,
                             fontSize: 20,
@@ -152,7 +135,7 @@ class _LoginScreenState extends State<LoginScreen> {
                         ),
                         const SizedBox(height: 8),
                         const Text(
-                          'Sign in to your account',
+                          'Enter your email address and we will send you a verification code.',
                           style: TextStyle(
                             color: _textSec,
                             fontSize: 14,
@@ -183,6 +166,8 @@ class _LoginScreenState extends State<LoginScreen> {
                           ),
                           const SizedBox(height: 24),
                         ],
+
+
                         
                         const Text(
                           'Email',
@@ -221,90 +206,13 @@ class _LoginScreenState extends State<LoginScreen> {
                             return null;
                           },
                         ),
-                        const SizedBox(height: 20),
-                        
-                        const Text(
-                          'Password',
-                          style: TextStyle(color: _textPrim, fontSize: 13, fontWeight: FontWeight.w500),
-                        ),
-                        const SizedBox(height: 8),
-                        TextFormField(
-                          controller: _passwordController,
-                          obscureText: _obscurePassword,
-                          style: const TextStyle(color: _textPrim, fontSize: 15),
-                          decoration: InputDecoration(
-                            hintText: '••••••••',
-                            hintStyle: const TextStyle(color: _textMut, letterSpacing: 2),
-                            suffixIcon: IconButton(
-                              icon: Icon(
-                                _obscurePassword ? Icons.visibility_off_outlined : Icons.visibility_outlined,
-                                color: _textMut,
-                                size: 20,
-                              ),
-                              onPressed: () {
-                                setState(() {
-                                  _obscurePassword = !_obscurePassword;
-                                });
-                              },
-                            ),
-                            filled: true,
-                            fillColor: Colors.white,
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(12),
-                              borderSide: const BorderSide(color: _borderColor),
-                            ),
-                            enabledBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(12),
-                              borderSide: const BorderSide(color: _borderColor),
-                            ),
-                            focusedBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(12),
-                              borderSide: const BorderSide(color: _primaryColor, width: 1.5),
-                            ),
-                            errorBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(12),
-                              borderSide: const BorderSide(color: _danger, width: 1),
-                            ),
-                          ),
-                          validator: (value) {
-                            if (value == null || value.isEmpty) return 'Please enter your password';
-                            return null;
-                          },
-                        ),
-                        const SizedBox(height: 12),
-                        
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: TextButton(
-                            onPressed: () {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(builder: (_) => const ForgotPasswordScreen()),
-                              );
-                            }, // Forgot password action
-                            style: TextButton.styleFrom(
-                              padding: EdgeInsets.zero,
-                              minimumSize: Size.zero,
-                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                            ),
-                            child: const Text(
-                              'Forgot password?',
-                              style: TextStyle(
-                                color: _primaryColor,
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ),
-                        ),
                         
                         const SizedBox(height: 24),
                         
                         SizedBox(
                           width: double.infinity,
                           child: ElevatedButton(
-                            onPressed: _isLoading ? null : _handleLogin,
+                            onPressed: _isLoading ? null : _handleResetRequest,
                             style: ElevatedButton.styleFrom(
                               padding: const EdgeInsets.symmetric(vertical: 16),
                               backgroundColor: _primaryColor,
@@ -324,52 +232,18 @@ class _LoginScreenState extends State<LoginScreen> {
                                       strokeWidth: 2,
                                     ),
                                   )
-                                : const Row(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      Text(
-                                        'Sign in',
-                                        style: TextStyle(
-                                          fontSize: 15,
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                      ),
-                                      SizedBox(width: 8),
-                                      Icon(Icons.arrow_forward, size: 18),
-                                    ],
+                                : const Text(
+                                    'Send Code',
+                                    style: TextStyle(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w600,
+                                    ),
                                   ),
                           ),
                         ),
                       ],
                     ),
                   ),
-                ),
-                
-                const SizedBox(height: 24),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Text(
-                      "Don't have an account? ",
-                      style: TextStyle(color: _textSec, fontSize: 14),
-                    ),
-                    GestureDetector(
-                      onTap: () {
-                        Navigator.pushReplacement(
-                          context,
-                          MaterialPageRoute(builder: (_) => const RegisterScreen()),
-                        );
-                      },
-                      child: const Text(
-                        'Sign up',
-                        style: TextStyle(
-                          color: _primaryColor,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
                 ),
               ],
             ),

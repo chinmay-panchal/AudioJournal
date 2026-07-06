@@ -19,6 +19,8 @@ import 'transcription_service.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
 
+enum ProcessingState { idle, processing, tooShort, serverError }
+
 class RecorderService extends ChangeNotifier {
   static final RecorderService _instance = RecorderService._internal();
   factory RecorderService() => _instance;
@@ -29,12 +31,22 @@ class RecorderService extends ChangeNotifier {
   String? _currentRecordingPath;
   List<Recording> _recordings = [];
   TranscriptionLanguage _selectedLanguage = TranscriptionLanguage.auto;
+  ProcessingState _processingState = ProcessingState.idle;
+  String? _lastErrorMessage;
 
   bool get isRecording => _isRecording;
   Duration get duration => _duration;
   String? get currentRecordingPath => _currentRecordingPath;
   List<Recording> get recordings => _recordings;
   TranscriptionLanguage get selectedLanguage => _selectedLanguage;
+  String? get lastErrorMessage => _lastErrorMessage;
+  ProcessingState get processingState => _processingState;
+
+  void clearError() {
+    _lastErrorMessage = null;
+    _processingState = ProcessingState.idle;
+    notifyListeners();
+  }
 
   set selectedLanguage(TranscriptionLanguage lang) {
     _selectedLanguage = lang;
@@ -65,6 +77,11 @@ class RecorderService extends ChangeNotifier {
     // Any recording still marked 'pending' after startup was interrupted by a
     // crash or force-quit. Reset it to 'failed' so the user can tap Retry.
     await _resetStalePendingRecordings();
+    // Any recording still in 'idle' state was saved by the background service
+    // while the app was closed and never started processing. Mark it failed
+    // (Draft) so the user can retry. This must only run at startup — NOT on
+    // every loadRecordings() call, or new recordings get wrongly Draft-ed.
+    await _resetIdleRecordings();
   }
 
   void _onAndroidTaskData(Object data) {
@@ -672,7 +689,17 @@ class RecorderService extends ChangeNotifier {
   /// Updates the in-memory recording and persists sidecar at each stage:
   /// idle → pending → done | failed.
   void _triggerTranscription(String audioPath, {bool isImported = false}) {
+    if (!File(audioPath).existsSync()) {
+      debugPrint('[RecorderService] File missing at start of transcription. Likely deleted for being too short.');
+      _lastErrorMessage = 'tooShort';
+      _processingState = ProcessingState.tooShort;
+      notifyListeners();
+      return;
+    }
+
     _setTranscriptStatus(audioPath, TranscriptStatus.pending);
+    _processingState = ProcessingState.processing;
+    notifyListeners();
 
     final languageCode = _selectedLanguage.apiCode;
 
@@ -682,7 +709,13 @@ class RecorderService extends ChangeNotifier {
         debugPrint(
           '[RecorderService] Clean file missing, skipping transcription.',
         );
-        if (cleanAudioPath != audioPath) cleanFile.deleteSync();
+        _lastErrorMessage = null;
+        _processingState = ProcessingState.serverError;
+        _setTranscriptStatus(audioPath, TranscriptStatus.failed);
+        notifyListeners();
+        if (cleanAudioPath != audioPath) {
+          try { cleanFile.deleteSync(); } catch (_) {}
+        }
         return;
       }
 
@@ -698,22 +731,22 @@ class RecorderService extends ChangeNotifier {
 
       if (cleanDurationMs < 10000) {
         debugPrint(
-          '[RecorderService] Cleaned file too short (${cleanDurationMs}ms), skipping transcription.',
+          '[RecorderService] Cleaned file too short (${cleanDurationMs}ms), skipping transcription and deleting.',
         );
-        final rec = _findByPath(audioPath);
-        final sidecar = TranscriptionSidecar(
-          status: TranscriptStatus.done,
-          transcript: '',
-          summary: '',
-          title: null,
-          language: languageCode,
-          durationMs: rec?.duration.inMilliseconds,
-        );
-        TranscriptionService.saveSidecar(audioPath, sidecar);
-        _applyTranscriptSidecar(audioPath, sidecar);
         if (cleanAudioPath != audioPath && cleanFile.existsSync()) {
           cleanFile.deleteSync();
         }
+        
+        final rec = _findByPath(audioPath);
+        if (rec != null) {
+          // It's invalid/too short, so just delete it entirely.
+          await deleteRecording(rec);
+        }
+
+        // Signal UI: recording was too short — no backend call will be made.
+        _lastErrorMessage = 'tooShort';
+        _processingState = ProcessingState.tooShort;
+        notifyListeners();
         return;
       }
 
@@ -756,9 +789,27 @@ class RecorderService extends ChangeNotifier {
               final rec = _findByPath(audioPath);
               if (rec != null) renameRecording(rec, renameTarget);
             }
+            // Transcription done — delete local audio file (now synced to backend)
+            try {
+              final localFile = File(audioPath);
+              if (localFile.existsSync()) {
+                localFile.deleteSync();
+                debugPrint('[RecorderService] Deleted local audio after sync: $audioPath');
+              }
+            } catch (e) {
+              debugPrint('[RecorderService] Could not delete local audio: $e');
+            }
+            // Move back to idle so UI can refresh
+            _processingState = ProcessingState.idle;
+            notifyListeners();
           })
           .catchError((Object err) {
             debugPrint('[RecorderService] Transcription failed: $err');
+            final errStr = err.toString();
+            final isServerError = errStr.contains('Connection refused') ||
+                errStr.contains('SocketException') ||
+                errStr.contains('Error saving transcription') ||
+                errStr.contains('connection error');
             final rec = _findByPath(audioPath);
             final sidecar = TranscriptionSidecar(
               status: TranscriptStatus.failed,
@@ -767,6 +818,13 @@ class RecorderService extends ChangeNotifier {
             );
             TranscriptionService.saveSidecar(audioPath, sidecar);
             _applyTranscriptSidecar(audioPath, sidecar);
+            if (isServerError) {
+              _lastErrorMessage = 'serverError';
+              _processingState = ProcessingState.serverError;
+            } else {
+              _processingState = ProcessingState.idle;
+            }
+            notifyListeners();
           })
           .whenComplete(() {
             if (cleanAudioPath != audioPath) {
@@ -809,12 +867,36 @@ class RecorderService extends ChangeNotifier {
 
   /// Public method to retry a failed transcription.
   ///
-  /// Always uses the "whole-file" path (same as imported audio): the entire
-  /// audio is sent to Gemini in one request, then posted to the backend with
-  /// [generate_summary=true]. This is simpler and more robust than the
-  /// live-chunking path — ideal after a backend disconnect, Dio error, or crash.
+  /// Resets processingState to processing and re-triggers the full pipeline.
   void retryTranscription(Recording recording) {
+    _lastErrorMessage = null;
+    _processingState = ProcessingState.processing;
+    notifyListeners();
     _triggerTranscription(recording.path, isImported: true);
+  }
+
+  /// Called once on startup. Resets any recording stuck in [TranscriptStatus.idle]
+  /// — which means the background service saved the file but the app was closed
+  /// before transcription ever started. Marking them [failed] puts them in Drafts.
+  Future<void> _resetIdleRecordings() async {
+    bool changed = false;
+    for (final rec in _recordings) {
+      if (rec.transcriptStatus == TranscriptStatus.idle) {
+        debugPrint(
+          '[RecorderService] Startup: idle recording detected: ${rec.path} — marking failed (Draft)',
+        );
+        final sidecar = TranscriptionSidecar(
+          status: TranscriptStatus.failed,
+          durationMs: rec.duration == Duration.zero
+              ? null
+              : rec.duration.inMilliseconds,
+        );
+        await TranscriptionService.saveSidecar(rec.path, sidecar);
+        rec.applyTranscript(sidecar);
+        changed = true;
+      }
+    }
+    if (changed) notifyListeners();
   }
 
   /// Called once on startup. Resets any recording stuck in [TranscriptStatus.pending]
@@ -925,6 +1007,22 @@ class RecorderService extends ChangeNotifier {
                 );
               }
             }
+
+            // Delete the file immediately if it is too short (< 10 seconds).
+            // This prevents invalid recordings from cluttering Drafts or the Library.
+            if (rec.duration.inMilliseconds > 0 && rec.duration.inMilliseconds < 10000) {
+              debugPrint('[RecorderService] loadRecordings: Found invalid short recording (${rec.duration.inMilliseconds}ms), deleting: ${file.path}');
+              try {
+                if (file.existsSync()) file.deleteSync();
+                await TranscriptionService.deleteSidecar(file.path);
+              } catch (_) {}
+              continue; // Skip adding this to the list
+            }
+
+            // Note: idle → failed (Draft) promotion is intentionally NOT done
+            // here. It only happens once at startup via _resetIdleRecordings()
+            // to avoid marking brand-new recordings as Draft before transcription
+            // has a chance to start.
 
             fetched.add(rec);
           }

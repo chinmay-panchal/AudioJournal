@@ -87,6 +87,18 @@ class AuthService extends ChangeNotifier {
       if (detail != null) {
         if (detail is String) {
           throw Exception(detail);
+        } else if (detail is List && detail.isNotEmpty) {
+          final errors = detail.map((e) {
+            if (e is Map && e['msg'] != null) {
+              String msg = e['msg'].toString();
+              if (msg.startsWith('Value error, ')) {
+                msg = msg.substring(13);
+              }
+              return msg;
+            }
+            return e.toString();
+          }).join('\n');
+          throw Exception(errors);
         } else {
           throw Exception(detail.toString());
         }
@@ -149,6 +161,18 @@ class AuthService extends ChangeNotifier {
       if (detail != null) {
         if (detail is String) {
           throw Exception(detail);
+        } else if (detail is List && detail.isNotEmpty) {
+          final errors = detail.map((e) {
+            if (e is Map && e['msg'] != null) {
+              String msg = e['msg'].toString();
+              if (msg.startsWith('Value error, ')) {
+                msg = msg.substring(13);
+              }
+              return msg;
+            }
+            return e.toString();
+          }).join('\n');
+          throw Exception(errors);
         } else {
           throw Exception(detail.toString());
         }
@@ -158,6 +182,70 @@ class AuthService extends ChangeNotifier {
       debugPrint('[AuthService] Registration failed with generic error: $e');
       debugPrint('Stacktrace: $stacktrace');
       rethrow;
+    }
+  }
+
+  Future<void> requestPasswordReset(String email) async {
+    try {
+      debugPrint('[AuthService] Request URL: $kApiBaseUrl/auth/forgot-password');
+      final response = await _dio.post(
+        '/auth/forgot-password',
+        data: {'email': email},
+      );
+
+      debugPrint('[AuthService] Forgot password response status: ${response.statusCode}');
+      if (response.statusCode != 200) {
+        throw Exception(response.data?['detail'] ?? 'Failed to send OTP');
+      }
+    } on DioException catch (e) {
+      final detail = e.response?.data?['detail'];
+      if (detail != null) throw Exception(detail.toString());
+      throw Exception(e.message ?? 'Network error');
+    }
+  }
+
+  /// Verifies the OTP sent to [email] and returns a reset_session_token.
+  Future<String> verifyOtp(String email, String otp) async {
+    try {
+      debugPrint('[AuthService] Request URL: $kApiBaseUrl/auth/verify-otp');
+      final response = await _dio.post(
+        '/auth/verify-otp',
+        data: {'email': email, 'otp': otp},
+      );
+
+      debugPrint('[AuthService] Verify OTP response status: ${response.statusCode}');
+      final resetToken = response.data?['reset_session_token'];
+      if (resetToken == null) throw Exception('No session token returned');
+      return resetToken as String;
+    } on DioException catch (e) {
+      final detail = e.response?.data?['detail'];
+      if (detail != null) throw Exception(detail.toString());
+      throw Exception(e.message ?? 'Network error');
+    }
+  }
+
+  Future<void> resetPassword(String resetSessionToken, String newPassword) async {
+    try {
+      debugPrint('[AuthService] Request URL: $kApiBaseUrl/auth/reset-password');
+      final response = await _dio.post(
+        '/auth/reset-password',
+        data: {'reset_session_token': resetSessionToken, 'new_password': newPassword},
+      );
+
+      debugPrint('[AuthService] Reset password response status: ${response.statusCode}');
+      if (response.statusCode != 200) {
+        throw Exception(response.data?['detail'] ?? 'Failed to reset password');
+      }
+    } on DioException catch (e) {
+      final detail = e.response?.data?['detail'];
+      if (detail != null) {
+        if (detail is List && detail.isNotEmpty) {
+          final errors = detail.map((e) => e['msg'] ?? e.toString()).join('\n');
+          throw Exception(errors);
+        }
+        throw Exception(detail.toString());
+      }
+      throw Exception(e.message ?? 'Network error');
     }
   }
 
