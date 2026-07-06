@@ -11,7 +11,9 @@ class ApiService {
       BaseOptions(
         baseUrl: kApiBaseUrl,
         connectTimeout: const Duration(seconds: 15),
-        receiveTimeout: const Duration(seconds: 15),
+        receiveTimeout: const Duration(
+          minutes: 10,
+        ), // large file imports can take several minutes
       ),
     );
 
@@ -165,6 +167,22 @@ class ApiService {
     CancelToken? cancelToken,
   }) {
     return _dio.post<T>(
+      path,
+      data: data,
+      queryParameters: queryParameters,
+      options: options,
+      cancelToken: cancelToken,
+    );
+  }
+
+  Future<Response<T>> delete<T>(
+    String path, {
+    dynamic data,
+    Map<String, dynamic>? queryParameters,
+    Options? options,
+    CancelToken? cancelToken,
+  }) {
+    return _dio.delete<T>(
       path,
       data: data,
       queryParameters: queryParameters,

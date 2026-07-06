@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'screens/recorder_screen.dart';
+import 'screens/main_screen.dart';
 import 'screens/login_screen.dart';
 import 'services/recorder_service.dart';
 import 'services/auth_service.dart';
@@ -32,18 +32,18 @@ class MyApp extends StatelessWidget {
           title: 'Voice Recorder',
           debugShowCheckedModeBanner: false,
           theme: ThemeData(
-            brightness: Brightness.dark,
-            primarySwatch: Colors.indigo,
-            scaffoldBackgroundColor: const Color(0xFF111827),
+            brightness: Brightness.light,
+            primaryColor: const Color(0xFFF97316),
+            scaffoldBackgroundColor: Colors.white,
             fontFamily: 'Inter',
           ),
           // Check if session is initialized and authenticated
           home: authService.initialized
-              ? (authService.isAuthenticated ? const RecorderScreen() : const LoginScreen())
+              ? (authService.isAuthenticated ? const MainScreen() : const LoginScreen())
               : const Scaffold(
-                  backgroundColor: Color(0xFF0A0E1A),
+                  backgroundColor: Colors.white,
                   body: Center(
-                    child: CircularProgressIndicator(color: Colors.indigo),
+                    child: CircularProgressIndicator(color: Color(0xFFF97316)),
                   ),
                 ),
         );
@@ -51,4 +51,3 @@ class MyApp extends StatelessWidget {
     );
   }
 }
-

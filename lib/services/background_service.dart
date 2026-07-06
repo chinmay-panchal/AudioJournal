@@ -150,15 +150,17 @@ class AudioRecordingTaskHandler extends TaskHandler {
   }
 
   @override
-  void onReceiveData(Object data) {
+  void onReceiveData(Object data) async {
     if (data is Map<String, dynamic> && data['action'] == 'stop') {
+      await _stopRecording();
       FlutterForegroundTask.stopService();
     }
   }
 
   @override
-  void onNotificationButtonPressed(String id) {
+  void onNotificationButtonPressed(String id) async {
     if (id == 'btn_stop') {
+      await _stopRecording();
       FlutterForegroundTask.stopService();
     }
   }
@@ -258,7 +260,8 @@ class BackgroundService {
 
   static Future<bool> stop() async {
     FlutterForegroundTask.sendDataToTask({'action': 'stop'});
-    final result = await FlutterForegroundTask.stopService();
-    return result is ServiceRequestSuccess;
+    // We let the background isolate handle the actual stopService() call
+    // after it finishes saving the file and sending the 'stopped' event.
+    return true;
   }
 }
