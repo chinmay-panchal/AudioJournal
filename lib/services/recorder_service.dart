@@ -178,16 +178,13 @@ class RecorderService extends ChangeNotifier {
       final notificationStatus = await Permission.notification.request();
       return recordStatus.isGranted && notificationStatus.isGranted;
     } else if (Platform.isIOS) {
-      final status = await Permission.microphone.status;
-      debugPrint('Mic permission current status: $status');
+        final result = await Permission.microphone.request();
+        debugPrint('Mic permission after request: $result');
 
-      if (status.isPermanentlyDenied || status.isDenied) {
-        await openAppSettings();
-        return false;
-      }
+        if (result.isPermanentlyDenied) {
+          await openAppSettings();
+        }
 
-      final result = await Permission.microphone.request();
-      debugPrint('Mic permission after request: $result');
       return result.isGranted;
     }
     return false;

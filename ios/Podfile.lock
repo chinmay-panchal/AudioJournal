@@ -1,4 +1,9 @@
 PODS:
+  - ffmpeg_kit_flutter_new_audio (7.1.1):
+    - ffmpeg_kit_flutter_new_audio/audio (= 7.1.1)
+    - Flutter
+  - ffmpeg_kit_flutter_new_audio/audio (7.1.1):
+    - Flutter
   - Flutter (1.0.0)
   - flutter_foreground_task (0.0.1):
     - Flutter
@@ -6,11 +11,14 @@ PODS:
     - Flutter
 
 DEPENDENCIES:
+  - ffmpeg_kit_flutter_new_audio (from `.symlinks/plugins/ffmpeg_kit_flutter_new_audio/ios`)
   - Flutter (from `Flutter`)
   - flutter_foreground_task (from `.symlinks/plugins/flutter_foreground_task/ios`)
   - whisper_flutter_new (from `.symlinks/plugins/whisper_flutter_new/ios`)
 
 EXTERNAL SOURCES:
+  ffmpeg_kit_flutter_new_audio:
+    :path: ".symlinks/plugins/ffmpeg_kit_flutter_new_audio/ios"
   Flutter:
     :path: Flutter
   flutter_foreground_task:
@@ -19,10 +27,11 @@ EXTERNAL SOURCES:
     :path: ".symlinks/plugins/whisper_flutter_new/ios"
 
 SPEC CHECKSUMS:
+  ffmpeg_kit_flutter_new_audio: 96938651839bda1fedaf527b7279ba8624b70335
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
   flutter_foreground_task: a159d2c2173b33699ddb3e6c2a067045d7cebb89
   whisper_flutter_new: 9276535665f51f845831fe94859b2cccd0334a70
 
-PODFILE CHECKSUM: 251cb053df7158f337c0712f2ab29f4e0fa474ce
+PODFILE CHECKSUM: e30f02f9d1c72c47bb6344a0a748c9d268180865
 
 COCOAPODS: 1.16.2
