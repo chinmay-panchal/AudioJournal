@@ -178,7 +178,13 @@ class _LibraryTabState extends State<LibraryTab> {
 
   final Map<String, bool> _isDownloadingShare = {};
 
-  Future<void> _handleShare(_TranscriptItem item) async {
+  Future<void> _handleShare(_TranscriptItem item, BuildContext buttonContext) async {
+    // Capture the share button's render rect before any async gap (iOS popover anchor).
+    final box = buttonContext.findRenderObject() as RenderBox?;
+    final shareOrigin = box != null
+        ? box.localToGlobal(Offset.zero) & box.size
+        : const Rect.fromLTWH(0, 0, 1, 1);
+
     setState(() {
       _isDownloadingShare[item.id] = true;
     });
@@ -206,15 +212,17 @@ class _LibraryTabState extends State<LibraryTab> {
 
       final text = '${item.title}\n\nSummary:\n${item.summaryText}\n\nTranscript:\n${fullTranscript.isNotEmpty ? fullTranscript : "(Failed to load transcript)"}';
 
+
+
       if (item.audioUrl == null) {
-        await Share.share(text);
+        await Share.share(text, sharePositionOrigin: shareOrigin);
         return;
       }
 
       final tempDir = await getTemporaryDirectory();
       final ext = item.audioUrl!.contains('.wav') ? '.wav' : '.m4a';
       final savePath = '${tempDir.path}/${item.id}$ext';
-      
+
       final file = File(savePath);
       if (!await file.exists()) {
         await Dio().download(item.audioUrl!, savePath);
@@ -223,6 +231,7 @@ class _LibraryTabState extends State<LibraryTab> {
       await Share.shareXFiles(
         [XFile(savePath)],
         text: text,
+        sharePositionOrigin: shareOrigin,
       );
     } catch (e) {
       debugPrint('Error sharing: $e');
@@ -686,31 +695,33 @@ class _LibraryTabState extends State<LibraryTab> {
                                             const SizedBox(width: 8),
                                           ],
                                           Expanded(
-                                            child: OutlinedButton.icon(
-                                              onPressed: () => _handleShare(item),
-                                              icon: _isDownloadingShare[item.id] == true
-                                                  ? const SizedBox(
-                                                      width: 16,
-                                                      height: 16,
-                                                      child: CircularProgressIndicator(strokeWidth: 2),
-                                                    )
-                                                  : const Icon(
-                                                      Icons.share_outlined,
-                                                      size: 16,
-                                                      color: Colors.black87),
-                                              label: const Text('Share',
-                                                  maxLines: 1,
-                                                  overflow: TextOverflow.ellipsis,
-                                                  style: TextStyle(
-                                                      color: Colors.black87)),
-                                              style: OutlinedButton.styleFrom(
-                                                side: BorderSide(
-                                                    color: Colors.grey
-                                                        .withValues(alpha: 0.3)),
-                                                shape: RoundedRectangleBorder(
-                                                    borderRadius:
-                                                        BorderRadius.circular(8)),
-                                                padding: const EdgeInsets.symmetric(horizontal: 4),
+                                            child: Builder(
+                                              builder: (btnCtx) => OutlinedButton.icon(
+                                                onPressed: () => _handleShare(item, btnCtx),
+                                                icon: _isDownloadingShare[item.id] == true
+                                                    ? const SizedBox(
+                                                        width: 16,
+                                                        height: 16,
+                                                        child: CircularProgressIndicator(strokeWidth: 2),
+                                                      )
+                                                    : const Icon(
+                                                        Icons.share_outlined,
+                                                        size: 16,
+                                                        color: Colors.black87),
+                                                label: const Text('Share',
+                                                    maxLines: 1,
+                                                    overflow: TextOverflow.ellipsis,
+                                                    style: TextStyle(
+                                                        color: Colors.black87)),
+                                                style: OutlinedButton.styleFrom(
+                                                  side: BorderSide(
+                                                      color: Colors.grey
+                                                          .withValues(alpha: 0.3)),
+                                                  shape: RoundedRectangleBorder(
+                                                      borderRadius:
+                                                          BorderRadius.circular(8)),
+                                                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                                                ),
                                               ),
                                             ),
                                           ),
