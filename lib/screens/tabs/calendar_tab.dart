@@ -354,21 +354,24 @@ class _CalendarTabState extends State<CalendarTab> {
     final keyboardInset = MediaQuery.viewInsetsOf(context).bottom;
     final keyboardOpen = keyboardInset > 50;
 
-    return AnimatedBuilder(
-      animation: Listenable.merge([_chatService, _recorderService]),
-      builder: (context, _) {
-        final messages = _chatService.messages;
-        final isLoading = _chatService.isLoading;
+    return GestureDetector(
+      onTap: () => FocusScope.of(context).unfocus(),
+      behavior: HitTestBehavior.opaque,
+      child: AnimatedBuilder(
+        animation: Listenable.merge([_chatService, _recorderService]),
+        builder: (context, _) {
+          final messages = _chatService.messages;
+          final isLoading = _chatService.isLoading;
 
-        return ColoredBox(
-          color: Colors.white,
-          child: SafeArea(
-            bottom: false,
-            child: Padding(
-              padding: EdgeInsets.only(bottom: keyboardInset),
-              child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
+          return ColoredBox(
+            color: Colors.white,
+            child: SafeArea(
+              bottom: false,
+              child: Padding(
+                padding: EdgeInsets.only(bottom: keyboardInset),
+                child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
                 // ── Header (hidden when keyboard open) ──────────────────────
                   if (!keyboardOpen)
                     Padding(
@@ -448,8 +451,9 @@ class _CalendarTabState extends State<CalendarTab> {
           ),
         );
       },
-    );
-  }
+    ),
+  );
+}
 
 
   // ── Calendar widget ────────────────────────────────────────────────────────
@@ -675,6 +679,7 @@ class _CalendarTabState extends State<CalendarTab> {
 
     return ListView.builder(
       controller: _scrollController,
+      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       padding: const EdgeInsets.fromLTRB(14, 8, 14, 8),
       itemCount: messages.length + (isLoading ? 1 : 0),
       itemBuilder: (context, index) {
