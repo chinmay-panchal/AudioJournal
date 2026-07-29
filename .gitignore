@@ -49,3 +49,8 @@ assets/models/*.bin
 # Generated plugin files
 **/generated_plugin_registrant.*
 **/generated_plugins.cmake
+.env
+.env.*
+build/
+**/build/
+**/GeneratedPluginRegistrant.*

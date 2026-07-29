@@ -102,7 +102,7 @@ class _RecordTabState extends State<RecordTab>
   Future<void> _fetchRecentSummaries() async {
     setState(() => _isLoadingSummary = true);
     try {
-      final resp = await ApiService().get('/transcribe');
+      final resp = await ApiService().get('/transcribe/');
       final data = resp.data;
       if (data is Map<String, dynamic> && data['transcripts'] is List) {
         final list = data['transcripts'] as List;
@@ -302,7 +302,7 @@ class _RecordTabState extends State<RecordTab>
   Future<void> _showCombineSheet() async {
     List<TranscriptItem> items = [];
     try {
-      final resp = await ApiService().get('/transcribe');
+      final resp = await ApiService().get('/transcribe/');
       final data = resp.data;
       if (data is Map<String, dynamic> && data['transcripts'] is List) {
         for (final t in data['transcripts'] as List) {
