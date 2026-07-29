@@ -1,4 +1,7 @@
+import 'dart:convert';
 import 'package:dio/dio.dart';
+import 'package:encrypt/encrypt.dart' as encrypt;
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/foundation.dart' show debugPrint;
 import '../constants.dart';
 import 'auth_service.dart';
@@ -53,6 +56,14 @@ class ApiService {
             debugPrint('  - No access token found in AuthService.');
           }
           return handler.next(options);
+        },
+        onResponse: (response, handler) {
+          debugPrint(
+            '🌐 [ApiService] Response for ${response.requestOptions.method} ${response.requestOptions.path}:',
+          );
+          debugPrint('   - Status: ${response.statusCode}');
+          debugPrint('   - Response Data: ${response.data}');
+          return handler.next(response);
         },
         onError: (DioException error, handler) async {
           debugPrint('[ApiService] Error encountered:');
@@ -189,5 +200,48 @@ class ApiService {
       options: options,
       cancelToken: cancelToken,
     );
+  }
+
+  String? _cachedGeminiKey;
+
+  Future<String> fetchAndDecryptGeminiKey() async {
+    if (_cachedGeminiKey != null) return _cachedGeminiKey!;
+    
+    debugPrint('[ApiService] Attempting to fetch Gemini key from /config/gemini-key...');
+    try {
+      final response = await get('/config/gemini-key');
+      debugPrint('[ApiService] Received response for Gemini key: status ${response.statusCode}');
+      
+      if (response.statusCode == 200 && response.data != null) {
+        final encryptedKeyString = response.data['encrypted_key'] as String;
+        
+        final envKey = dotenv.env['ENCRYPTION_KEY'];
+        if (envKey == null || envKey.isEmpty) {
+          debugPrint('[ApiService] FATAL ERROR: ENCRYPTION_KEY not found in .env');
+          throw Exception('ENCRYPTION_KEY not found in .env');
+        }
+        
+        try {
+          final key = encrypt.Key.fromUtf8(envKey);
+          final b64Key = encrypt.Key.fromBase64(base64Url.encode(key.bytes));
+          final fernet = encrypt.Fernet(b64Key);
+          final encrypter = encrypt.Encrypter(fernet);
+          
+          final encrypted = encrypt.Encrypted.fromBase64(encryptedKeyString);
+          _cachedGeminiKey = encrypter.decrypt(encrypted);
+          debugPrint('[ApiService] Successfully decrypted Gemini API key!');
+          return _cachedGeminiKey!;
+        } catch (e) {
+          debugPrint('[ApiService] FATAL ERROR decrypting Gemini key. Your Flutter .env ENCRYPTION_KEY ($envKey) might not match the backend or is not 32 bytes. Error details: $e');
+          throw Exception('Failed to decrypt gemini key. Ensure ENCRYPTION_KEY exactly matches the backend. Error: $e');
+        }
+      } else {
+        debugPrint('[ApiService] ERROR: Failed to fetch gemini key. Status Code: ${response.statusCode}');
+        throw Exception('Failed to fetch gemini key');
+      }
+    } catch (e) {
+      debugPrint('[ApiService] ERROR during fetchAndDecryptGeminiKey process: $e');
+      rethrow;
+    }
   }
 }

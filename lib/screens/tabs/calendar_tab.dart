@@ -55,7 +55,7 @@ class _CalendarTabState extends State<CalendarTab> {
 
   Future<void> _fetchTranscriptDates() async {
     try {
-      final resp = await ApiService().get('/transcribe');
+      final resp = await ApiService().get('/transcribe/');
       final data = resp.data;
       final Set<DateTime> dates = {};
 

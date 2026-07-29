@@ -1,22 +1,28 @@
+import 'dart:io';
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import '../../services/api_service.dart';
 import '../../services/recorder_service.dart';
 import '../../services/transcription_service.dart';
 import '../../widgets/drafts_sheet.dart';
+import 'package:just_audio/just_audio.dart' as ja;
 
 class _TranscriptItem {
   final String id;
   final String title;
   final String summaryText;
   final String dateStr;
+  final String? audioUrl;
 
   _TranscriptItem({
     required this.id,
     required this.title,
     required this.summaryText,
     required this.dateStr,
+    this.audioUrl,
   });
 }
 
@@ -34,6 +40,12 @@ class _LibraryTabState extends State<LibraryTab> {
   String _searchQuery = '';
   final Set<String> _expandedItems = {};
   final _recorderService = RecorderService();
+  final Map<String, String> _localAudioPaths = {};
+  final Map<String, bool> _isDownloading = {};
+  
+  // Audio playback state
+  String? _playingItemId;
+  final _audioPlayer = ja.AudioPlayer();
 
   int get _draftCount => _recorderService.recordings
       .where((r) => r.transcriptStatus == TranscriptStatus.failed)
@@ -43,7 +55,29 @@ class _LibraryTabState extends State<LibraryTab> {
   void initState() {
     super.initState();
     _recorderService.addListener(_onServiceChange);
+    
+    // Listen to player completion
+    _audioPlayer.playerStateStream.listen((state) {
+      if (state.processingState == ja.ProcessingState.completed) {
+        if (mounted) setState(() => _playingItemId = null);
+      }
+    });
+
     _fetchTranscripts();
+  }
+
+  Future<void> _checkLocalFiles(List<_TranscriptItem> items) async {
+    final tempDir = await getTemporaryDirectory();
+    for (final item in items) {
+      if (item.audioUrl != null) {
+        final ext = item.audioUrl!.contains('.wav') ? '.wav' : '.m4a';
+        final savePath = '${tempDir.path}/${item.id}$ext';
+        if (await File(savePath).exists()) {
+          _localAudioPaths[item.id] = savePath;
+        }
+      }
+    }
+    if (mounted) setState(() {});
   }
 
   @override
@@ -59,7 +93,7 @@ class _LibraryTabState extends State<LibraryTab> {
   Future<void> _fetchTranscripts() async {
     setState(() => _isLoading = true);
     try {
-      final resp = await ApiService().get('/transcribe');
+      final resp = await ApiService().get('/transcribe/');
       final data = resp.data;
       final List<_TranscriptItem> items = [];
 
@@ -83,6 +117,13 @@ class _LibraryTabState extends State<LibraryTab> {
                   .toLocal();
               dateStr = DateFormat('MMM dd').format(dt);
             }
+            
+            String? audioUrl = t['audio_url']?.toString();
+            if (audioUrl != null && !audioUrl.startsWith('http')) {
+              if (!audioUrl.startsWith('/')) {
+                audioUrl = '/$audioUrl';
+              }
+            }
 
             if (id.isNotEmpty) {
               items.add(_TranscriptItem(
@@ -90,6 +131,7 @@ class _LibraryTabState extends State<LibraryTab> {
                 title: title,
                 summaryText: summaryText,
                 dateStr: dateStr,
+                audioUrl: audioUrl,
               ));
             }
           }
@@ -101,6 +143,7 @@ class _LibraryTabState extends State<LibraryTab> {
           _allItems = items;
           _filteredItems = items;
         });
+        _checkLocalFiles(items);
       }
     } catch (e) {
       debugPrint('[LibraryTab] fetch error: $e');
@@ -133,12 +176,121 @@ class _LibraryTabState extends State<LibraryTab> {
     });
   }
 
+  final Map<String, bool> _isDownloadingShare = {};
+
   Future<void> _handleShare(_TranscriptItem item) async {
+    setState(() {
+      _isDownloadingShare[item.id] = true;
+    });
+
     try {
-      final text = '${item.title}\n\n${item.summaryText}';
-      await Share.share(text);
+      // Fetch full transcript text from backend
+      String fullTranscript = '';
+      try {
+        final resp = await ApiService().get('/transcribe/${item.id}');
+        if (resp.data != null && resp.data['transcript'] != null) {
+          final segments = resp.data['transcript']['full_transcript_data'] as List?;
+          if (segments != null) {
+            fullTranscript = segments.map((s) {
+              final speaker = s['speaker']?.toString();
+              final text = s['text']?.toString() ?? '';
+              return (speaker != null && speaker.isNotEmpty)
+                  ? '$speaker: $text'
+                  : text;
+            }).join('\n\n');
+          }
+        }
+      } catch (e) {
+        debugPrint('Failed to fetch full transcript: $e');
+      }
+
+      final text = '${item.title}\n\nSummary:\n${item.summaryText}\n\nTranscript:\n${fullTranscript.isNotEmpty ? fullTranscript : "(Failed to load transcript)"}';
+
+      if (item.audioUrl == null) {
+        await Share.share(text);
+        return;
+      }
+
+      final tempDir = await getTemporaryDirectory();
+      final ext = item.audioUrl!.contains('.wav') ? '.wav' : '.m4a';
+      final savePath = '${tempDir.path}/${item.id}$ext';
+      
+      final file = File(savePath);
+      if (!await file.exists()) {
+        await Dio().download(item.audioUrl!, savePath);
+      }
+
+      await Share.shareXFiles(
+        [XFile(savePath)],
+        text: text,
+      );
     } catch (e) {
       debugPrint('Error sharing: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to prepare audio for sharing'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isDownloadingShare[item.id] = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _handleDownloadPlay(_TranscriptItem item) async {
+    if (item.audioUrl == null) return;
+
+    if (_playingItemId == item.id) {
+      await _audioPlayer.stop();
+      setState(() => _playingItemId = null);
+      return;
+    }
+
+    if (_localAudioPaths.containsKey(item.id)) {
+      // Play local file
+      try {
+        await _audioPlayer.stop();
+        await _audioPlayer.setFilePath(_localAudioPaths[item.id]!);
+        setState(() => _playingItemId = item.id);
+        await _audioPlayer.play();
+      } catch (e) {
+        debugPrint('Error playing audio: $e');
+      }
+      return;
+    }
+
+    // Download file
+    setState(() => _isDownloading[item.id] = true);
+    try {
+      final tempDir = await getTemporaryDirectory();
+      final ext = item.audioUrl!.contains('.wav') ? '.wav' : '.m4a';
+      final savePath = '${tempDir.path}/${item.id}$ext';
+      
+      await Dio().download(item.audioUrl!, savePath);
+      
+      if (mounted) {
+        setState(() {
+          _localAudioPaths[item.id] = savePath;
+          _isDownloading[item.id] = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('Error downloading audio: $e');
+      if (mounted) {
+        setState(() => _isDownloading[item.id] = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Failed to download audio'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 
@@ -501,54 +653,93 @@ class _LibraryTabState extends State<LibraryTab> {
                                       ),
                                       const SizedBox(height: 16),
                                       Row(
-                                        mainAxisAlignment:
-                                            MainAxisAlignment.end,
                                         children: [
-                                          OutlinedButton.icon(
-                                            onPressed: () =>
-                                                _handleShare(item),
-                                            icon: const Icon(
-                                                Icons.share_outlined,
-                                                size: 16,
-                                                color: Colors.black87),
-                                            label: const Text('Share',
-                                                style: TextStyle(
-                                                    color: Colors.black87)),
-                                            style: OutlinedButton.styleFrom(
-                                              side: BorderSide(
-                                                  color: Colors.grey
-                                                      .withValues(alpha: 0.3)),
-                                              shape: RoundedRectangleBorder(
-                                                  borderRadius:
-                                                      BorderRadius.circular(
-                                                          8)),
-                                              padding:
-                                                  const EdgeInsets.symmetric(
-                                                      horizontal: 16),
+                                          if (item.audioUrl != null) ...[
+                                            Expanded(
+                                              child: OutlinedButton.icon(
+                                                onPressed: () => _handleDownloadPlay(item),
+                                                icon: _isDownloading[item.id] == true
+                                                    ? const SizedBox(
+                                                        width: 16,
+                                                        height: 16,
+                                                        child: CircularProgressIndicator(strokeWidth: 2),
+                                                      )
+                                                    : Icon(
+                                                        _playingItemId == item.id ? Icons.stop : (_localAudioPaths.containsKey(item.id) ? Icons.play_arrow : Icons.download),
+                                                        size: 16,
+                                                        color: const Color(0xFFF97316),
+                                                      ),
+                                                label: Text(
+                                                  _playingItemId == item.id ? 'Stop' : (_localAudioPaths.containsKey(item.id) ? 'Play' : 'Download'),
+                                                  style: const TextStyle(color: Color(0xFFF97316)),
+                                                  maxLines: 1,
+                                                  overflow: TextOverflow.ellipsis,
+                                                ),
+                                                style: OutlinedButton.styleFrom(
+                                                  side: const BorderSide(color: Color(0xFFF97316)),
+                                                  shape: RoundedRectangleBorder(
+                                                      borderRadius: BorderRadius.circular(8)),
+                                                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                                                ),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 8),
+                                          ],
+                                          Expanded(
+                                            child: OutlinedButton.icon(
+                                              onPressed: () => _handleShare(item),
+                                              icon: _isDownloadingShare[item.id] == true
+                                                  ? const SizedBox(
+                                                      width: 16,
+                                                      height: 16,
+                                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                                    )
+                                                  : const Icon(
+                                                      Icons.share_outlined,
+                                                      size: 16,
+                                                      color: Colors.black87),
+                                              label: const Text('Share',
+                                                  maxLines: 1,
+                                                  overflow: TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                      color: Colors.black87)),
+                                              style: OutlinedButton.styleFrom(
+                                                side: BorderSide(
+                                                    color: Colors.grey
+                                                        .withValues(alpha: 0.3)),
+                                                shape: RoundedRectangleBorder(
+                                                    borderRadius:
+                                                        BorderRadius.circular(8)),
+                                                padding: const EdgeInsets.symmetric(horizontal: 4),
+                                              ),
                                             ),
                                           ),
                                           const SizedBox(width: 8),
-                                          OutlinedButton.icon(
-                                            onPressed: () =>
-                                                _handleDelete(item),
-                                            icon: const Icon(
-                                                Icons.delete_outline,
-                                                size: 16,
-                                                color: Colors.red),
-                                            label: const Text('Delete',
-                                                style: TextStyle(
-                                                    color: Colors.red)),
-                                            style: OutlinedButton.styleFrom(
-                                              side: BorderSide(
-                                                  color: Colors.red
-                                                      .withValues(alpha: 0.3)),
-                                              shape: RoundedRectangleBorder(
-                                                  borderRadius:
-                                                      BorderRadius.circular(
-                                                          8)),
-                                              padding:
-                                                  const EdgeInsets.symmetric(
-                                                      horizontal: 16),
+                                          Expanded(
+                                            child: OutlinedButton.icon(
+                                              onPressed: () =>
+                                                  _handleDelete(item),
+                                              icon: const Icon(
+                                                  Icons.delete_outline,
+                                                  size: 16,
+                                                  color: Colors.red),
+                                              label: const Text('Delete',
+                                                  maxLines: 1,
+                                                  overflow: TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                      color: Colors.red)),
+                                              style: OutlinedButton.styleFrom(
+                                                side: BorderSide(
+                                                    color: Colors.red
+                                                        .withValues(alpha: 0.3)),
+                                                shape: RoundedRectangleBorder(
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                            8)),
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                        horizontal: 4),
+                                              ),
                                             ),
                                           ),
                                         ],
