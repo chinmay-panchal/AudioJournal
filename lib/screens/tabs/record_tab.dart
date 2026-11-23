@@ -2,10 +2,14 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+import '../../constants.dart';
 import '../../services/recorder_service.dart';
 import '../../services/auth_service.dart';
 import '../../services/api_service.dart';
 import '../../widgets/combine_sheet.dart';
+import '../../widgets/recording_consent_sheet.dart';
 import '../login_screen.dart';
 
 // Public model for latest summary list
@@ -32,6 +36,7 @@ class RecordTab extends StatefulWidget {
 
 class _RecordTabState extends State<RecordTab>
     with TickerProviderStateMixin {
+  final _scaffoldKey = GlobalKey<ScaffoldState>();
   final _recorderService = RecorderService();
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
@@ -225,6 +230,23 @@ class _RecordTabState extends State<RecordTab>
     if (_recorderService.isRecording) {
       await _recorderService.stopRecording();
     } else {
+      // Show one-time consent sheet before first ever recording
+      final prefs = await SharedPreferences.getInstance();
+      final hasSeenConsent = prefs.getBool('has_seen_recording_consent') ?? false;
+
+      if (!hasSeenConsent) {
+        if (!mounted) return;
+        final agreed = await showModalBottomSheet<bool>(
+          context: context,
+          isScrollControlled: true,
+          backgroundColor: Colors.transparent,
+          builder: (_) => const RecordingConsentSheet(),
+        );
+        if (agreed != true) return; // User dismissed without tapping Continue
+        await prefs.setBool('has_seen_recording_consent', true);
+      }
+
+      if (!mounted) return;
       try {
         await _recorderService.startRecording();
       } catch (e) {
@@ -238,40 +260,122 @@ class _RecordTabState extends State<RecordTab>
   }
 
   Future<void> _handleLogout() async {
-    final confirm = await showDialog<bool>(
+    await AuthService().logout();
+    if (mounted) {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+        (route) => false,
+      );
+    }
+  }
+
+  Future<void> _handleDeleteAccount() async {
+    // Step 1: Confirmation dialog
+    final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: const Text(
-          'Logout',
-          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black),
+          'Delete Account?',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            color: Color(0xFF111827),
+            fontSize: 18,
+          ),
         ),
         content: const Text(
-          'Are you sure you want to log out?',
-          style: TextStyle(color: Colors.black54),
+          'This will permanently delete your account, all recordings, transcripts, summaries, and chat history. This action cannot be undone.',
+          style: TextStyle(color: Color(0xFF6B7280), fontSize: 14, height: 1.5),
         ),
+        actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text(
-              'Logout',
-              style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+          SizedBox(
+            width: double.infinity,
+            child: Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(ctx, false),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      side: const BorderSide(color: Color(0xFFE5E7EB)),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                    child: const Text(
+                      'Cancel',
+                      style: TextStyle(
+                        color: Color(0xFF6B7280),
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.pop(ctx, true),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      backgroundColor: const Color(0xFFEF4444),
+                      foregroundColor: Colors.white,
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                    child: const Text(
+                      'Delete',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         ],
       ),
     );
 
-    if (confirm == true) {
+    if (confirmed != true || !mounted) return;
+
+    // Step 2: Loading dialog
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(
+        child: CircularProgressIndicator(color: Color(0xFFF97316)),
+      ),
+    );
+
+    try {
+      await ApiService().delete('/auth/account');
+      // Clear all local session data
       await AuthService().logout();
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('has_seen_recording_consent');
+
       if (mounted) {
         Navigator.of(context).pushAndRemoveUntil(
           MaterialPageRoute(builder: (_) => const LoginScreen()),
           (route) => false,
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        Navigator.of(context).pop(); // close loading dialog
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              e.toString().replaceAll('Exception: ', ''),
+              style: const TextStyle(color: Colors.white),
+            ),
+            backgroundColor: const Color(0xFFEF4444),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
         );
       }
     }
@@ -405,7 +509,12 @@ class _RecordTabState extends State<RecordTab>
     final dateString = DateFormat('EEEE, MMMM dd').format(now);
 
     return Scaffold(
+      key: _scaffoldKey,
       backgroundColor: Colors.white,
+      endDrawer: _AppDrawer(
+        onLogout: _handleLogout,
+        onDeleteAccount: _handleDeleteAccount,
+      ),
       body: Stack(
         children: [
           SafeArea(
@@ -487,7 +596,7 @@ class _RecordTabState extends State<RecordTab>
                                 ),
                                 const SizedBox(width: 8),
                                 GestureDetector(
-                                  onTap: _handleLogout,
+                                  onTap: () => _scaffoldKey.currentState!.openEndDrawer(),
                                   child: Container(
                                     width: 40,
                                     height: 40,
@@ -511,9 +620,9 @@ class _RecordTabState extends State<RecordTab>
                                     ),
                                     child: const Center(
                                       child: Icon(
-                                        Icons.logout_rounded,
+                                        Icons.person_outline_rounded,
                                         color: Colors.white,
-                                        size: 18,
+                                        size: 20,
                                       ),
                                     ),
                                   ),
@@ -1072,6 +1181,244 @@ class _TimerDisplay extends StatelessWidget {
         fontWeight: FontWeight.bold,
         color: Color(0xFFF97316),
         fontFeatures: [FontFeature.tabularFigures()],
+      ),
+    );
+  }
+}
+
+// ─── App Drawer ───────────────────────────────────────────────────────────────
+
+class _AppDrawer extends StatelessWidget {
+  final VoidCallback onLogout;
+  final VoidCallback onDeleteAccount;
+
+  const _AppDrawer({
+    required this.onLogout,
+    required this.onDeleteAccount,
+  });
+
+  static const _primaryColor = Color(0xFFF97316);
+  static const _textPrim = Color(0xFF111827);
+  static const _textSec = Color(0xFF6B7280);
+  static const _textMut = Color(0xFF9CA3AF);
+  static const _borderColor = Color(0xFFE5E7EB);
+  static const _danger = Color(0xFFEF4444);
+
+  Future<void> _openPrivacyPolicy() async {
+    final uri = Uri.parse(kPrivacyPolicyUrl);
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final email = AuthService().userEmail ?? '';
+
+    return Drawer(
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.horizontal(left: Radius.circular(24)),
+      ),
+      child: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // ── Header ────────────────────────────────────────────────
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.all(16),
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [Color(0xFF818CF8), _primaryColor],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: _primaryColor.withValues(alpha: 0.25),
+                    blurRadius: 16,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 44,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.25),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.person_rounded,
+                      color: Colors.white,
+                      size: 24,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'My Account',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          email,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 8),
+
+            // ── Menu items ────────────────────────────────────────────
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Column(
+                children: [
+                  // Privacy Policy
+                  _DrawerItem(
+                    icon: Icons.privacy_tip_outlined,
+                    label: 'Privacy Policy',
+                    iconColor: _primaryColor,
+                    textColor: _textPrim,
+                    borderColor: _borderColor,
+                    onTap: () {
+                      Navigator.pop(context);
+                      _openPrivacyPolicy();
+                    },
+                  ),
+                  const SizedBox(height: 10),
+
+                  // Log Out
+                  _DrawerItem(
+                    icon: Icons.logout_rounded,
+                    label: 'Log Out',
+                    iconColor: _textSec,
+                    textColor: _textSec,
+                    borderColor: _borderColor,
+                    onTap: () {
+                      Navigator.pop(context);
+                      onLogout();
+                    },
+                  ),
+                  const SizedBox(height: 10),
+
+                  // Delete Account (danger)
+                  _DrawerItem(
+                    icon: Icons.delete_forever_outlined,
+                    label: 'Delete Account',
+                    iconColor: _danger,
+                    textColor: _danger,
+                    borderColor: _danger.withValues(alpha: 0.2),
+                    backgroundColor: _danger.withValues(alpha: 0.04),
+                    onTap: () {
+                      Navigator.pop(context);
+                      onDeleteAccount();
+                    },
+                  ),
+                ],
+              ),
+            ),
+
+            const Spacer(),
+
+            // ── Footer ────────────────────────────────────────────────
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 16),
+                child: Text(
+                  'VoiceNote AI',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: _textMut,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _DrawerItem extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color iconColor;
+  final Color textColor;
+  final Color borderColor;
+  final Color? backgroundColor;
+  final VoidCallback onTap;
+
+  const _DrawerItem({
+    required this.icon,
+    required this.label,
+    required this.iconColor,
+    required this.textColor,
+    required this.borderColor,
+    required this.onTap,
+    this.backgroundColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: BoxDecoration(
+            color: backgroundColor ?? Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: borderColor),
+          ),
+          child: Row(
+            children: [
+              Icon(icon, color: iconColor, size: 20),
+              const SizedBox(width: 12),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: textColor,
+                ),
+              ),
+              const Spacer(),
+              Icon(
+                Icons.chevron_right_rounded,
+                color: iconColor.withValues(alpha: 0.5),
+                size: 18,
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
